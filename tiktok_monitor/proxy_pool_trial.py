@@ -977,6 +977,20 @@ def main() -> None:
         len(pool),
         args.check_pace_sec,
     )
+    # 起動時に有効な閾値を1行で残す。定数を変えて再起動したのに反映されて
+    # いない(古いプロセスが生きている)といった取り違えを、ログだけで
+    # 判別できるようにするため。実測との突き合わせにも要る。
+    logger.info(
+        "guards: stall_check=%.0fs, stall_reconnect=%.0fs (max %d/session, cooldown %.0fs), "
+        "hard_timeout=%.0fs, initial_connect=%d attempts/live (cooldown %.0fs), "
+        "quarantine_after=%d not_found, handoff=%s",
+        STALL_THRESHOLD_SEC,
+        LONG_STALL_THRESHOLD_SEC, MAX_STALL_RECONNECTS_PER_SESSION, STALL_RECONNECT_COOLDOWN_SEC,
+        HARD_TIMEOUT_SEC,
+        MAX_INITIAL_CONNECT_ATTEMPTS, INITIAL_CONNECT_COOLDOWN_SEC,
+        QUARANTINE_AFTER_NOT_FOUND,
+        "on" if HANDOFF_ENABLED else "off",
+    )
 
     conn = db.connect(args.db_path)
     db.init_schema(conn)

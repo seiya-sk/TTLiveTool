@@ -184,3 +184,54 @@ def test_health_report_distinguishes_no_shortage_from_no_data(capsys):
     assert result["measurable"] is False, "判定不能を「不足なし」と報告している"
     assert "判定できない" in out
     assert result["at_capacity_sec"] > 0
+
+
+def test_scanning_while_full_goes_through_the_shared_pacer(tmp_path):
+    """満杯時の巡回も5秒ペーシングを通ること。
+
+    署名とは無関係だが、TikTok 側へのリクエスト頻度に関わる。満杯時に
+    巡回が加速すると 403 / レート制限のリスクが上がる。CheckPacer は
+    ディスパッチ・満杯時巡回・生存確認で **同じロックと最終実行時刻** を
+    共有しており、3経路の合計レートが制限される(個別ではない)。
+    """
+    from tiktok_monitor import watch as watch_mod
+
+    trial = make_trial(10, status=w.LIVE, tmp_path=tmp_path)
+    trial.pool = ["a", "b", "c"]
+    fill_recording_slots(trial)
+
+    pacer = watch_mod.CheckPacer(pace_sec=0.05)
+    calls = []
+
+    async def fake_status(username, web_proxy=None, on_error=None):
+        calls.append(time.monotonic())
+        return w.LIVE
+
+    trial.pacer = pacer
+
+    async def scenario():
+        import unittest.mock as m
+        with m.patch.object(watch_mod, "check_live_status", side_effect=fake_status):
+            for _ in range(4):
+                await trial._scan_while_full()
+
+    asyncio.run(scenario())
+
+    assert len(calls) == 4
+    gaps = [b - a for a, b in zip(calls, calls[1:])]
+    assert all(g >= 0.045 for g in gaps), f"ペーシングを迂回している: {gaps}"
+
+
+def test_scanning_while_full_does_not_take_a_recording_slot(tmp_path):
+    """確認に使うスロットを録画用に占有しないこと。占有すると録画本数が
+    減り、枠不足を自分で作り出すことになる。"""
+    trial = make_trial(10, status=w.LIVE, tmp_path=tmp_path)
+    trial.pool = ["someone_live"]
+    fill_recording_slots(trial, 9)
+    before = sum(1 for s in trial.slots if s.in_use)
+
+    asyncio.run(trial._scan_while_full())
+
+    after = sum(1 for s in trial.slots if s.in_use)
+    assert after == before == 9, f"録画本数が変わった: {before} -> {after}"
+    assert trial._borrow_check_slot() is not None, "確認用の空きが無くなった"

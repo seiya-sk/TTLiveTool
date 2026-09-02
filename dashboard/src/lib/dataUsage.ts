@@ -1,24 +1,16 @@
 import fs from "node:fs";
 import path from "node:path";
 import { getDb, resolveDbPath, resolveScreenshotDir } from "./db";
+import { getTableSizes } from "./tableSizes";
 import { basenameFromPath } from "./format";
 
-// dbstat is a read-only virtual table SQLite (and better-sqlite3's build)
-// exposes for exactly this purpose: SUM(pgsize) per table name gives the
-// real on-disk byte count without reading any row content, so this stays
-// fast even though live_event_raw_payloads alone is ~1GB (see db.py's
-// live_events comment for why that table is split out in the first place).
-// Still ~1.2s to scan the whole DB's page metadata though, so callers share
-// one call via getDataUsageReport() below rather than each fetching it
-// separately.
-function getTableSizes(): Map<string, number> {
-  const db = getDb();
-  const rows = db.prepare(`SELECT name, SUM(pgsize) as bytes FROM dbstat GROUP BY name`).all() as {
-    name: string;
-    bytes: number;
-  }[];
-  return new Map(rows.map((r) => [r.name, r.bytes]));
-}
+// テーブル別のサイズは dbstat から取るが、**この関数の中では集計しない**。
+// dbstat は DB の全ページを走査するため 4.6GB で39秒かかり、better-sqlite3 は
+// 同期APIなので Node のイベントループごと止まる。実測(2026-09-02)では
+// /settings/data の処理中、通常0.7秒の / が 28.3秒かかった -- データ管理を
+// 開いた人だけでなく、同時に見ている全員が巻き添えになる。
+// いまは別プロセス(ops/table_sizes.py)が集計したJSONを読むだけ。
+// 詳細は lib/tableSizes.ts を参照。
 
 function getDbFileBytes(): number {
   try {
@@ -54,11 +46,25 @@ export type StorageOverview = {
   screenshotsBytes: number;
   totalBytes: number;
   breakdown: StorageBreakdownRow[];
+  /** 内訳がまだ集計されていない(初回のみ)。合計だけは出せている。 */
+  breakdownPending: boolean;
 };
 
-function buildOverview(tableSizes: Map<string, number>): StorageOverview {
+function buildOverview(tableSizes: Map<string, number> | null): StorageOverview {
   const dbFileBytes = getDbFileBytes();
   const screenshotsBytes = listScreenshotFiles().reduce((sum, f) => sum + f.bytes, 0);
+
+  // 内訳がまだ集計されていない場合。合計サイズはファイルを stat するだけで
+  // 分かるので、そこだけ出して内訳は「集計中」にする(待たせない)。
+  if (!tableSizes) {
+    return {
+      dbFileBytes,
+      screenshotsBytes,
+      totalBytes: dbFileBytes + screenshotsBytes,
+      breakdown: [{ label: "スクリーンショット画像", bytes: screenshotsBytes }],
+      breakdownPending: true,
+    };
+  }
 
   const rawPayloadBytes = tableSizes.get("live_event_raw_payloads") ?? 0;
   const eventsBytes = tableSizes.get("live_events") ?? 0;
@@ -75,6 +81,7 @@ function buildOverview(tableSizes: Map<string, number>): StorageOverview {
     dbFileBytes,
     screenshotsBytes,
     totalBytes: dbFileBytes + screenshotsBytes,
+    breakdownPending: false,
     breakdown: [
       { label: "スクリーンショット画像", bytes: screenshotsBytes },
       { label: "生イベントデータ(raw_payload)", bytes: rawPayloadBytes },
@@ -107,11 +114,11 @@ export type SessionDataUsage = {
 // this estimate). Spreading the table's real total evenly per row is a
 // reasonable proxy since it's only used for "which session/streamer is
 // heaviest" comparisons, not billing-grade precision.
-function buildSessionUsage(tableSizes: Map<string, number>): SessionDataUsage[] {
+function buildSessionUsage(tableSizes: Map<string, number> | null): SessionDataUsage[] {
   const db = getDb();
 
   const totalEventRows = (db.prepare(`SELECT COUNT(*) as c FROM live_events`).get() as { c: number }).c;
-  const rawPayloadTotalBytes = tableSizes.get("live_event_raw_payloads") ?? 0;
+  const rawPayloadTotalBytes = tableSizes?.get("live_event_raw_payloads") ?? 0;
   const avgRawPayloadBytesPerRow = totalEventRows > 0 ? rawPayloadTotalBytes / totalEventRows : 0;
 
   const rows = db
@@ -220,6 +227,10 @@ export type DataUsageReport = {
   overview: StorageOverview;
   sessionUsage: SessionDataUsage[];
   streamerUsage: StreamerDataUsage[];
+  /** テーブル別サイズの集計時刻。未集計なら null。 */
+  sizesComputedAt: string | null;
+  /** 集計値が古く、裏で再集計中かどうか。 */
+  sizesStale: boolean;
 };
 
 // Single entry point for 設定/データ管理 (docs/dashboard-navigation-design.md
@@ -227,9 +238,16 @@ export type DataUsageReport = {
 // breakdowns off exactly one dbstat scan, rather than each view paying that
 // ~1.2s cost separately.
 export function getDataUsageReport(): DataUsageReport {
-  const tableSizes = getTableSizes();
+  const cached = getTableSizes();
+  const tableSizes = cached?.sizes ?? null;
   const overview = buildOverview(tableSizes);
   const sessionUsage = buildSessionUsage(tableSizes);
   const streamerUsage = aggregateByStreamer(sessionUsage);
-  return { overview, sessionUsage, streamerUsage };
+  return {
+    overview,
+    sessionUsage,
+    streamerUsage,
+    sizesComputedAt: cached ? cached.computedAt.toISOString() : null,
+    sizesStale: cached ? cached.stale : true,
+  };
 }

@@ -19,6 +19,7 @@ import {
 } from "@/lib/queries";
 import { avatarUrl, formatDuration, formatJst } from "@/lib/format";
 import { Avatar } from "@/components/Avatar";
+import { parseSessionOrigin, sessionBackTarget } from "@/lib/backLink";
 import { StatusBadge, type BadgeTone } from "@/components/StatusBadge";
 import Tabs, { type TabDef } from "@/components/Tabs";
 import { AiReport } from "./AiReport";
@@ -48,6 +49,11 @@ export default async function SessionDetailPage(props: PageProps<"/sessions/[id]
 
   const session = getSession(sessionId);
   if (!session) notFound();
+
+  // 遷移元に応じて「戻る」先を変える。直接URLを開いた場合など不明なときは
+  // 全件のライブ一覧に戻す(lib/backLink.ts の docstring を参照)。
+  const searchParams = await props.searchParams;
+  const backTarget = sessionBackTarget(parseSessionOrigin(searchParams.from), session);
 
   const viewerSeries = getViewerSeries(sessionId);
   const commentSeries = getCommentSeries(sessionId);
@@ -115,8 +121,8 @@ export default async function SessionDetailPage(props: PageProps<"/sessions/[id]
 
   return (
     <div className="container">
-      <Link href="/sessions" className="back-link">
-        ← ライブ一覧に戻る
+      <Link href={backTarget.href} className="back-link">
+        ← {backTarget.label}
       </Link>
       <div className="detail-title-row">
         <Link href={`/streamers/${session.tiktokAccountId}`} className="detail-title-link">

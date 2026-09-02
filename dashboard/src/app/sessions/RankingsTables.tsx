@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import { sessionDetailHref, type SessionOrigin } from "@/lib/backLink";
 import { Avatar } from "@/components/Avatar";
 import { DataTable, type Column } from "@/components/DataTable";
 import { RankBadge } from "@/components/RankBadge";
@@ -15,7 +16,9 @@ import type { SessionRankingRow } from "@/lib/queries";
 // and the rank badge (position in that sort) changes per tab. Previously
 // each tab showed a different reduced column subset; this shows more, not
 // less, so nothing that worked before stops working.
-const columns: Column<SessionRankingRow>[] = [
+// 列定義は linkFrom(遷移元)に依存するので、モジュール直下の定数ではなく
+// 関数にする。「詳細を見る」リンクに遷移元の印を付けるため。
+const makeColumns = (linkFrom: SessionOrigin): Column<SessionRankingRow>[] => [
   {
     key: "rank",
     label: "順位",
@@ -89,7 +92,7 @@ const columns: Column<SessionRankingRow>[] = [
     label: "操作",
     accessor: () => null,
     render: (r) => (
-      <Link href={`/sessions/${r.id}`} className="ranking-action-link">
+      <Link href={sessionDetailHref(r.id, linkFrom)} className="ranking-action-link">
         詳細を見る →
       </Link>
     ),
@@ -101,8 +104,17 @@ const columns: Column<SessionRankingRow>[] = [
 // highlight, matching the mock's row emphasis.
 const rowClassName = (_row: SessionRankingRow, index: number) => (index === 0 ? "ranking-row-top" : undefined);
 
-export function RankingsTables({ rows }: { rows: SessionRankingRow[] }) {
-  const rowHref = (r: SessionRankingRow) => `/sessions/${r.id}`;
+export function RankingsTables({
+  rows,
+  // どこから開かれた一覧なのか。詳細ページはこれを見て「戻る」先を決める
+  // (既定の全件一覧なら印を付けない)。lib/backLink.ts を参照。
+  linkFrom = null,
+}: {
+  rows: SessionRankingRow[];
+  linkFrom?: SessionOrigin;
+}) {
+  const rowHref = (r: SessionRankingRow) => sessionDetailHref(r.id, linkFrom);
+  const columns = makeColumns(linkFrom);
   const emptyMessage = "配信記録がありません。";
 
   const tabs: TabDef[] = [

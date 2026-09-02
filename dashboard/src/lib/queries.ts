@@ -17,6 +17,8 @@ export type SessionSummary = {
 
 export type SessionDetail = {
   id: number;
+  /** 戻り先の組み立てに使う(ライバーで絞り込んだ一覧へ戻すため)。 */
+  streamerId: number;
   streamerName: string;
   tiktokAccountId: string;
   title: string | null;
@@ -324,6 +326,7 @@ export function getSession(id: number): SessionDetail | undefined {
     .prepare(
       `SELECT
         ls.id as id,
+        s.id as streamerId,
         s.name as streamerName,
         s.tiktok_account_id as tiktokAccountId,
         ls.title as title,

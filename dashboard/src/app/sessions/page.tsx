@@ -40,7 +40,8 @@ export default async function SessionsListPage(props: PageProps<"/sessions">) {
           「{streamerName ?? `ライバーID ${streamerId}`}」で絞り込み中 ー <Link href="/sessions">絞り込み解除</Link>
         </p>
       )}
-      <RankingsTables rows={rows} />
+      {/* 絞り込み中の一覧から開いた詳細は、絞り込みを保ったまま戻す */}
+      <RankingsTables rows={rows} linkFrom={streamerId !== undefined ? "filtered" : null} />
     </div>
   );
 }

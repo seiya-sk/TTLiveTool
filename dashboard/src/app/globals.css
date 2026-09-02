@@ -1132,3 +1132,56 @@ th {
 .home-unassigned-banner span { color: var(--muted); }
 .home-unassigned-banner:hover { border-color: var(--foreground); }
 .home-unassigned-cta { margin-left: auto; color: var(--cyan) !important; white-space: nowrap; }
+
+/* --- ローディング用スケルトン -------------------------------------------
+   遷移そのものは loading.tsx で即座に行われるが、真っ白な画面や
+   スピナー1つだけだと「何が来るのか」が分からず体感が遅い。
+   ページの骨格を先に出すことで、読み込み中でも構造が読める。
+   prefers-reduced-motion では明滅を止める(前庭障害・光過敏への配慮)。 */
+.skeleton {
+  background: linear-gradient(90deg, var(--surface) 25%, var(--surface-2) 37%, var(--surface) 63%);
+  background-size: 400% 100%;
+  animation: skeleton-shimmer 1.4s ease-in-out infinite;
+  border-radius: 6px;
+  display: block;
+}
+
+@keyframes skeleton-shimmer {
+  0% { background-position: 100% 50%; }
+  100% { background-position: 0 50%; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .skeleton {
+    animation: none;
+    background: var(--surface-2);
+  }
+}
+
+.skeleton-row {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.skeleton-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px;
+  margin-bottom: 24px;
+}
+
+/* 視覚的には隠すが読み上げには残す。ローディングの状態通知に使う。 */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}

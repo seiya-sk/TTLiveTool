@@ -87,7 +87,7 @@ export default async function StreamerDetailPage(props: PageProps<"/streamers/[a
 
       <section className="streamer-detail-sessions">
         <h2>配信一覧</h2>
-        <RankingsTables rows={sessions} />
+        <RankingsTables rows={sessions} linkFrom="streamer" />
       </section>
     </div>
   );

@@ -1,0 +1,13 @@
+[Unit]
+Description=TTSLiveTool DB backup (daily tier)
+Documentation=file:/root/TTSLiveTool/ops/backup_db.py
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/TTSLiveTool
+ExecStart=/root/TTSLiveTool/.venv/bin/python /root/TTSLiveTool/ops/backup_db.py \
+  --db-path /root/TTSLiveTool/data/proxy_pool_trial/proxy5.db --tier daily
+StandardOutput=append:/var/log/tts-backup.log
+StandardError=append:/var/log/tts-backup.log
+Nice=15
+IOSchedulingClass=idle

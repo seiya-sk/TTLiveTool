@@ -1,0 +1,15 @@
+[Unit]
+Description=TTSLiveTool recorder heartbeat (Healthchecks.io)
+Documentation=file:/root/TTSLiveTool/ops/recorder_heartbeat.py
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/TTSLiveTool
+EnvironmentFile=/etc/tts-notify.env
+ExecStart=/root/TTSLiveTool/.venv/bin/python /root/TTSLiveTool/ops/recorder_heartbeat.py
+StandardOutput=append:/var/log/tts-notify.log
+StandardError=append:/var/log/tts-notify.log
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

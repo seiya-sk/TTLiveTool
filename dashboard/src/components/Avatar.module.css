@@ -1,0 +1,16 @@
+.avatar {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  color: #0b0f14;
+  font-weight: 700;
+  flex-shrink: 0;
+  line-height: 1;
+}
+
+.avatarImg {
+  border-radius: 999px;
+  object-fit: cover;
+  flex-shrink: 0;
+}

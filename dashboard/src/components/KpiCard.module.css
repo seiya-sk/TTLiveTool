@@ -1,0 +1,155 @@
+.card {
+  position: relative;
+  display: block;
+  overflow: hidden;
+  padding: 20px 22px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  isolation: isolate;
+}
+
+.card::before {
+  content: "";
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 2px;
+}
+
+.accent-pink::before {
+  background: var(--pink);
+}
+.accent-cyan::before {
+  background: var(--cyan);
+}
+.accent-purple::before {
+  background: var(--purple);
+}
+.accent-success::before {
+  background: var(--success);
+}
+.accent-warning::before {
+  background: var(--warning);
+}
+.accent-muted::before {
+  background: var(--muted);
+}
+
+a.card:hover {
+  border-color: color-mix(in srgb, var(--foreground) 30%, var(--border));
+}
+
+.featured {
+  padding: 24px 28px;
+}
+
+.top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+.icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 8px;
+  flex-shrink: 0;
+}
+
+.icon.pink {
+  color: var(--pink);
+  background: color-mix(in srgb, var(--pink) 16%, transparent);
+}
+.icon.cyan {
+  color: var(--cyan);
+  background: color-mix(in srgb, var(--cyan) 16%, transparent);
+}
+.icon.purple {
+  color: var(--purple);
+  background: color-mix(in srgb, var(--purple) 16%, transparent);
+}
+.icon.success {
+  color: var(--success);
+  background: color-mix(in srgb, var(--success) 16%, transparent);
+}
+.icon.warning {
+  color: var(--warning);
+  background: color-mix(in srgb, var(--warning) 16%, transparent);
+}
+.icon.muted {
+  color: var(--muted);
+  background: var(--surface-2);
+}
+
+.label {
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.value {
+  font-size: 2rem;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+  position: relative;
+  z-index: 1;
+}
+
+.featured .value {
+  font-size: 2.6rem;
+}
+
+.trend {
+  display: inline-block;
+  margin-top: 10px;
+  font-size: 0.78rem;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 999px;
+  position: relative;
+  z-index: 1;
+}
+
+.trend.up {
+  color: var(--pink);
+  background: color-mix(in srgb, var(--pink) 16%, transparent);
+}
+
+.trend.down {
+  color: var(--muted);
+  background: var(--surface-2);
+}
+
+.caption {
+  margin-top: 8px;
+  font-size: 0.78rem;
+  color: var(--muted);
+  position: relative;
+  z-index: 1;
+}
+
+.captionUp {
+  color: var(--cyan);
+  font-weight: 600;
+}
+
+.captionDown {
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.illustration {
+  position: absolute;
+  right: -16px;
+  bottom: -16px;
+  width: 130px;
+  height: 130px;
+  object-fit: contain;
+  opacity: 0.9;
+  pointer-events: none;
+  z-index: 0;
+}

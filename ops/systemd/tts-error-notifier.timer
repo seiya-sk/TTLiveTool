@@ -1,0 +1,11 @@
+[Unit]
+Description=Run TTSLiveTool error notifier every minute
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=10s
+Unit=tts-error-notifier.service
+
+[Install]
+WantedBy=timers.target

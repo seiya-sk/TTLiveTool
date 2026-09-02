@@ -1,0 +1,23 @@
+[Unit]
+Description=TTSLiveTool Dashboard (Next.js)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/TTSLiveTool/dashboard
+# 127.0.0.1 にのみバインド。外部公開は nginx(80番)経由に限定し、
+# 3000番を直接叩いてレート制限を迂回されることを防ぐ。
+ExecStart=/usr/bin/npm run start -- --hostname 127.0.0.1 --port 3000
+Environment=NODE_ENV=production
+# 通知設定画面の「テスト送信」は ops/progress_notifier.py --test-send を
+# 子プロセスとして起動するため、Chatworkのトークンを継承させる必要がある。
+# '-' 付きなのでファイルが無くてもダッシュボード自体は起動する
+# (テスト送信だけが失敗し、その旨が画面に出る)。
+EnvironmentFile=-/etc/tts-notify.env
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/var/log/tts-dashboard.log
+StandardError=append:/var/log/tts-dashboard.log
+
+[Install]
+WantedBy=multi-user.target

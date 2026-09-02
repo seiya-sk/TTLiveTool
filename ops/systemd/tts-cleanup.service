@@ -1,0 +1,22 @@
+[Unit]
+Description=TTSLiveTool raw_payload cleanup (long-running trial DB)
+Documentation=file:/root/TTSLiveTool/ops/cleanup_job.py
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/TTSLiveTool
+# retention=1日。ここを変えれば保持期間が変わる(app_settings ではなく
+# 明示指定にして、設定がユニットファイル上で見えるようにしている)。
+EnvironmentFile=-/etc/tts-notify.env
+ExecStart=/root/TTSLiveTool/ops/healthcheck_wrap.sh \
+  /root/TTSLiveTool/.venv/bin/python /root/TTSLiveTool/ops/cleanup_job.py \
+  --db-path /root/TTSLiveTool/data/proxy_pool_trial/proxy5.db \
+  --retention-days 1
+# journald と、Chatwork通知等に食わせやすい追記ログの両方に出す
+StandardOutput=append:/var/log/tts-cleanup.log
+StandardError=append:/var/log/tts-cleanup.log
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=multi-user.target

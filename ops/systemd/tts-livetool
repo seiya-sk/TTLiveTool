@@ -1,0 +1,10 @@
+/var/log/tts-cleanup.log /var/log/tts-dashboard.log /var/log/tts-notify.log /var/log/tts-backup.log {
+    su root syslog
+    weekly
+    rotate 8
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}

@@ -1,0 +1,13 @@
+[Unit]
+Description=Run TTSLiveTool raw_payload cleanup hourly
+
+[Timer]
+OnCalendar=hourly
+# 起動直後の毎時00分ちょうどを避け、録画の書き込みピークとずらす
+RandomizedDelaySec=300
+# VPS再起動で取りこぼした回を次回起動時に1度だけ実行
+Persistent=true
+Unit=tts-cleanup.service
+
+[Install]
+WantedBy=timers.target

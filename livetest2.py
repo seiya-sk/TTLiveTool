@@ -1,0 +1,344 @@
+import traceback
+import time
+import re
+from datetime import datetime
+import gspread
+from google.oauth2.service_account import Credentials
+
+from TikTokLive import TikTokLiveClient
+from TikTokLive.events import (
+    GiftEvent, FollowEvent, LikeEvent, ConnectEvent, 
+    DisconnectEvent, JoinEvent, CommentEvent
+)
+from TikTokLive.client.errors import UserOfflineError
+
+# ==========================================
+# 設定情報の入力
+# ==========================================
+TIKTOK_USERNAME = "renamaru_roilala"
+SPREADSHEET_ID = "14Mza3mNJ-jKriyB8PXWXt4Lay3choKFhWYpMwC6XWfc"
+
+# ==========================================
+# Googleスプレッドシートの初期設定
+# ==========================================
+SCOPES = [
+    'https://www.googleapis.com/auth/spreadsheets',
+    'https://www.googleapis.com/auth/drive'
+]
+try:
+    credentials = Credentials.from_service_account_file("credentials.json", scopes=SCOPES)
+    gc = gspread.authorize(credentials)
+    sh = gc.open_by_key(SPREADSHEET_ID)
+except Exception as e:
+    print(f"❌ スプレッドシート認証エラー: {e}")
+    exit()
+
+def get_or_create_worksheet(sheet_title, headers):
+    try:
+        ws = sh.worksheet(sheet_title)
+        if not ws.get_all_values():
+            ws.append_row(headers)
+    except gspread.exceptions.WorksheetNotFound:
+        ws = sh.add_worksheet(title=sheet_title, rows="1000", cols="20")
+        ws.append_row(headers)
+    return ws
+
+# シートの定義
+ws_summary = get_or_create_worksheet("all_summaries", ["セッションID", "配信開始", "配信終了", "総配信時間", "最終合計いいね数"])
+ws_gifts = get_or_create_worksheet("all_gifts", ["セッションID", "時間", "ユーザー名", "ギフレベ", "ギフト名", "コイン単価", "ダイヤ単価"])
+ws_follows = get_or_create_worksheet("all_follows", ["セッションID", "時間", "ユーザー名", "ギフレベ"])
+ws_joins = get_or_create_worksheet("all_joins", ["セッションID", "時間", "ユーザー名", "ギフレベ", "入室回数"])
+ws_comments = get_or_create_worksheet("all_comments", ["セッションID", "時間", "ユーザー名", "ギフレベ", "メンバーレベル", "コメント内容"])
+ws_battles = get_or_create_worksheet("all_battles", ["セッションID", "時間", "相手のID"])
+
+# ==========================================
+# グローバル変数
+# ==========================================
+session_id = None
+start_time = None
+total_likes = 0
+offline_time = None
+GRACE_PERIOD_SECONDS = 300  # 5分
+
+# バッチ処理（一括保存）用の変数
+comment_batch = []
+last_comment_flush_time = time.time()
+COMMENT_FLUSH_INTERVAL = 180  # 3分（180秒）ごとにコメントを保存
+
+user_join_counts = {}
+join_batch = []
+last_join_flush_time = time.time()
+JOIN_FLUSH_INTERVAL = 60  # 60秒ごとにまとめて入室を保存
+
+recorded_opponents = set()
+
+# ==========================================
+# ツール関数
+# ==========================================
+def log_error(event_name, error):
+    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    error_msg = f"[{current_time}] ⚠️ {event_name} でエラー: {error}\n{traceback.format_exc()}\n"
+    print(f"[{current_time}] ⚠️ エラー発生（error_log.txt を確認）: {error}")
+    with open("error_log.txt", "a", encoding="utf-8") as f:
+        f.write(error_msg)
+
+def write_to_sheet(worksheet, row_data):
+    try:
+        worksheet.append_row(row_data)
+    except Exception as e:
+        log_error(f"スプレッドシート書き込み ({worksheet.title})", e)
+
+def get_safe_g_level(user):
+    """ギフレベを安全に取得し、エラー(NoneType等)を防ぐ"""
+    try:
+        lvl = getattr(user, 'gifter_level', None)
+        if lvl is None and hasattr(user, 'pay_grade'):
+            lvl = getattr(user.pay_grade, 'level', None)
+        return int(lvl) if lvl is not None else 0
+    except Exception:
+        return 0
+
+def flush_comments():
+    """溜まったコメントを一括で書き込む"""
+    global comment_batch, last_comment_flush_time
+    if not comment_batch:
+        return
+    try:
+        batch_to_write = list(comment_batch) # データ消失を防ぐためコピーを作成
+        comment_batch.clear()
+        ws_comments.append_rows(batch_to_write, value_input_option='USER_ENTERED')
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] 📝 コメント {len(batch_to_write)} 件をスプレッドシートに一括保存しました。")
+        last_comment_flush_time = time.time()
+    except Exception as e:
+        log_error("コメント一括保存", e)
+
+def flush_joins():
+    """溜まった入室記録を一括で書き込む"""
+    global join_batch, last_join_flush_time
+    if not join_batch:
+        return
+    try:
+        batch_to_write = list(join_batch) # データ消失を防ぐためコピーを作成
+        join_batch.clear()
+        ws_joins.append_rows(batch_to_write, value_input_option='USER_ENTERED')
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] 🚪 入室記録 {len(batch_to_write)} 件をスプレッドシートに一括保存しました。")
+        last_join_flush_time = time.time()
+    except Exception as e:
+        log_error("入室一括保存", e)
+
+def finish_live_session():
+    """配信終了時のサマリー書き込みと、残ったデータの保存"""
+    global session_id, start_time, total_likes
+    if not session_id:
+        return 
+
+    flush_comments()
+    flush_joins()
+
+    end_time = datetime.now()
+    duration = end_time - start_time if start_time else "不明"
+    end_time_str = end_time.strftime('%Y-%m-%d %H:%M:%S')
+    start_time_str = start_time.strftime('%Y-%m-%d %H:%M:%S') if start_time else "不明"
+    
+    print(f"\n[{end_time.strftime('%H:%M:%S')}] 🛑 配信終了を確定。サマリーを保存します。")
+    write_to_sheet(ws_summary, [session_id, start_time_str, end_time_str, str(duration), total_likes])
+    print(f"=== 配信サマリー (Session: {session_id}) ===\n総配信時間: {duration}\n最終いいね数: {total_likes}\n====================================\n")
+    
+    session_id = None
+
+# ==========================================
+# クライアント初期化 ＆ バトル横取り処理
+# ==========================================
+client = TikTokLiveClient(unique_id=TIKTOK_USERNAME)
+
+original_emit = client.emit
+
+def custom_emit(event_name, *args, **kwargs):
+    """ライブラリが捨てる前の通信データを横取りし、配信者情報(anchor_info)からのみIDを抽出する"""
+    global recorded_opponents, session_id
+    
+    event_str = str(event_name)
+    event_obj = args[0] if args else None
+
+    if any(keyword in event_str for keyword in ["Link", "Battle", "Armies", "Message", "Group"]):
+        try:
+            event_data = event_obj.as_dict if hasattr(event_obj, "as_dict") else vars(event_obj)
+            anchor_info = event_data.get("anchor_info") or getattr(event_obj, "anchor_info", None)
+            
+            if anchor_info:
+                raw_data_str = str(anchor_info)
+                # 💡ドット(.)やハイフン(-)を含むIDにも完全対応！
+                pattern = r"display_id['\"]?\s*[:=]\s*['\"]?([a-zA-Z0-9_.-]+)['\"]?"
+                found_ids = re.findall(pattern, raw_data_str)
+                
+                for opponent_id in found_ids:
+                    if opponent_id != "0" and opponent_id != "None" and TIKTOK_USERNAME not in opponent_id:
+                        if opponent_id not in recorded_opponents:
+                            recorded_opponents.add(opponent_id)
+                            current_time = datetime.now().strftime("%H:%M:%S")
+                            safe_session = session_id if session_id else "unknown_session"
+                            
+                            write_to_sheet(ws_battles, [safe_session, current_time, str(opponent_id)])
+                            print(f"[{current_time}] ⚔️ 新しいバトル相手を検知・記録しました: {opponent_id}")
+        except Exception:
+            pass
+            
+    return original_emit(event_name, *args, **kwargs)
+
+client.emit = custom_emit
+
+# ==========================================
+# イベントごとの処理
+# ==========================================
+@client.on(ConnectEvent)
+async def on_connect(event: ConnectEvent):
+    global start_time, session_id, total_likes, offline_time, user_join_counts, recorded_opponents
+    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    if offline_time and (datetime.now() - offline_time).total_seconds() < GRACE_PERIOD_SECONDS:
+        print(f"[{current_time}] 🔄 再接続に成功しました！集計を継続します。")
+    else:
+        start_time = datetime.now()
+        total_likes = 0
+        user_join_counts.clear()
+        join_batch.clear()
+        comment_batch.clear()
+        recorded_opponents.clear() 
+        session_id = start_time.strftime("%Y%m%d_%H%M%S")
+        print(f"\n[{current_time}] 🚀 新しいライブ配信を検知しました！ (Session: {session_id})")
+        
+    offline_time = None
+
+@client.on(JoinEvent)
+async def on_join(event: JoinEvent):
+    global user_join_counts, join_batch, last_join_flush_time
+    try:
+        g_level = get_safe_g_level(event.user)
+        
+        # 💡 テスト用: 0以上に設定。テスト終了後 >= 25 に戻してください。
+        if g_level >= 0:
+            current_time = datetime.now().strftime("%H:%M:%S")
+            name = event.user.nickname
+            user_id = getattr(event.user, 'user_id', getattr(event.user, 'id', getattr(event.user, 'unique_id', name)))
+            
+            user_join_counts[user_id] = user_join_counts.get(user_id, 0) + 1
+            join_count = user_join_counts[user_id]
+            safe_session = session_id if session_id else "unknown_session"
+            
+            join_batch.append([safe_session, current_time, name, g_level, join_count])
+            print(f"[{current_time}] 🚪 {name}(Lv.{g_level}) が入室！(累計 {join_count}回目)")
+            
+            if time.time() - last_join_flush_time >= JOIN_FLUSH_INTERVAL:
+                flush_joins()
+                
+    except Exception as e:
+        log_error("JoinEvent", e)
+
+@client.on(GiftEvent)
+async def on_gift(event: GiftEvent):
+    try:
+        current_time = datetime.now().strftime("%H:%M:%S")
+        name = event.user.nickname
+        gift_name = event.gift.name
+        g_level = get_safe_g_level(event.user)
+        
+        coin_count = 0
+        diamond_count = 0
+        if hasattr(event.gift, 'info') and event.gift.info is not None:
+            coin_count = getattr(event.gift.info, 'coin_count', 0) or 0
+            diamond_count = getattr(event.gift.info, 'diamond_count', getattr(event.gift.info, 'diamond', 0)) or 0
+        else:
+            coin_count = getattr(event.gift, 'coin_count', 0) or 0
+            diamond_count = getattr(event.gift, 'diamond_count', getattr(event.gift, 'diamond', 0)) or 0
+        
+        safe_session = session_id if session_id else "unknown_session"
+        write_to_sheet(ws_gifts, [safe_session, current_time, name, g_level, gift_name, coin_count, diamond_count])
+        print(f"[{current_time}] 🎁 {name}(Lv.{g_level}) が {gift_name} を送信！")
+    except Exception as e:
+        log_error("GiftEvent", e)
+
+@client.on(CommentEvent)
+async def on_comment(event: CommentEvent):
+    global comment_batch, last_comment_flush_time
+    try:
+        current_time = datetime.now().strftime("%H:%M:%S")
+        name = event.user.nickname
+        comment = event.comment
+        g_level = get_safe_g_level(event.user)
+        
+        badge_lvl = getattr(event.user, 'badge_level', None)
+        member_lvl = getattr(event.user, 'member_level', None)
+        member_level = badge_lvl if badge_lvl is not None else (member_lvl if member_lvl is not None else 0)
+        
+        safe_session = session_id if session_id else "unknown_session"
+        comment_batch.append([safe_session, current_time, name, g_level, member_level, comment])
+        
+        if time.time() - last_comment_flush_time >= COMMENT_FLUSH_INTERVAL:
+            flush_comments()
+            
+    except Exception as e:
+        log_error("CommentEvent", e)
+
+@client.on(FollowEvent)
+async def on_follow(event: FollowEvent):
+    try:
+        current_time = datetime.now().strftime("%H:%M:%S")
+        name = event.user.nickname
+        g_level = get_safe_g_level(event.user)
+        
+        safe_session = session_id if session_id else "unknown_session"
+        write_to_sheet(ws_follows, [safe_session, current_time, name, g_level])
+        print(f"[{current_time}] 👤 {name}(Lv.{g_level}) がフォローしました！")
+    except Exception as e:
+        log_error("FollowEvent", e)
+
+@client.on(LikeEvent)
+async def on_like(event: LikeEvent):
+    global total_likes
+    try:
+        if hasattr(event, 'total'):
+            total_likes = event.total
+        else:
+            total_likes += getattr(event, 'count', 1)
+            
+        current_time = datetime.now().strftime("%H:%M:%S")
+        print(f"[{current_time}] ❤️ いいね更新: 現在 {total_likes} 回")
+    except Exception as e:
+        log_error("LikeEvent", e)
+
+# ==========================================
+# メイン処理
+# ==========================================
+if __name__ == "__main__":
+    print(f"👁️ [{TIKTOK_USERNAME}] の配信監視をスタートします... (Ctrl+C で安全に停止)")
+    
+    while True:
+        try:
+            client.run()
+        except UserOfflineError:
+            pass
+        except KeyboardInterrupt:
+            print("\n🛑 監視ツールを手動で停止しました。残りのデータを保存します...")
+            if session_id:
+                finish_live_session()
+            break
+        except Exception as e:
+            log_error("メインループ", e)
+
+        if offline_time is None:
+            offline_time = datetime.now()
+
+        offline_duration = (datetime.now() - offline_time).total_seconds()
+
+        if offline_duration >= GRACE_PERIOD_SECONDS:
+            if session_id:
+                finish_live_session()
+                
+            current_time = datetime.now().strftime("%H:%M:%S")
+            print(f"[{current_time}] 💤 まだオフラインです。60秒後に再確認します...")
+            time.sleep(60)
+        else:
+            remain = int(GRACE_PERIOD_SECONDS - offline_duration)
+            current_time = datetime.now().strftime("%H:%M:%S")
+            print(f"[{current_time}] ⚠️ 通信切断。完全終了判定まで残り {remain} 秒... (再接続試行)")
+            time.sleep(10)

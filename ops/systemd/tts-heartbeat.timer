@@ -1,0 +1,11 @@
+[Unit]
+Description=Send TTSLiveTool recorder heartbeat every 5 minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Unit=tts-heartbeat.service
+
+[Install]
+WantedBy=timers.target

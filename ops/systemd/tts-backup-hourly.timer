@@ -1,0 +1,12 @@
+[Unit]
+Description=Short-term TTSLiveTool DB backup every 4 hours
+
+[Timer]
+# 4時間ごと。直近の事故から素早く戻すための世代。
+OnCalendar=*-*-* 02,06,10,14,18,22:23:00
+RandomizedDelaySec=300
+Persistent=true
+Unit=tts-backup-hourly.service
+
+[Install]
+WantedBy=timers.target

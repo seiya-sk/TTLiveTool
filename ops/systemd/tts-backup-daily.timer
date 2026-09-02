@@ -1,0 +1,13 @@
+[Unit]
+Description=Long-term TTSLiveTool DB backup once a day
+
+[Timer]
+# 1日1本。短期世代が全部流れた後でも戻れるようにする。
+# 掃除ジョブ(毎時)とバックアップが重ならないよう時刻をずらす。
+OnCalendar=*-*-* 04:37:00
+RandomizedDelaySec=600
+Persistent=true
+Unit=tts-backup-daily.service
+
+[Install]
+WantedBy=timers.target

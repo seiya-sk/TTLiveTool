@@ -1,0 +1,14 @@
+[Unit]
+Description=Send TTSLiveTool progress digests hourly at HH:01
+
+[Timer]
+# 毎時01分。窓(HH-1:00〜HH:00)が閉じた直後に送る。
+OnCalendar=*-*-* *:01:00
+AccuracySec=15s
+# 再起動で取りこぼした回を次回起動時に1度実行(さらに backfill-hours が
+# 複数窓の抜けを埋める)
+Persistent=true
+Unit=tts-progress-notifier.service
+
+[Install]
+WantedBy=timers.target

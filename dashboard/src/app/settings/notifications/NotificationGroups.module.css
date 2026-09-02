@@ -1,0 +1,53 @@
+.wrap { display: flex; flex-direction: column; gap: 20px; }
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 20px;
+}
+
+.cardHead { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.cardTitle { font-size: 16px; font-weight: 700; display: flex; align-items: center; gap: 10px; }
+.actions { display: flex; gap: 8px; flex-wrap: wrap; }
+
+.meta { margin-top: 12px; display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 10px 20px; }
+.metaItem { font-size: 13px; color: var(--muted); }
+.metaItem b { display: block; color: var(--foreground); font-weight: 600; margin-top: 2px; word-break: break-all; }
+
+.members { margin-top: 14px; font-size: 13px; color: var(--muted); }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.chip { background: rgba(37, 244, 238, 0.1); border: 1px solid var(--border); color: var(--foreground);
+        border-radius: 999px; padding: 3px 10px; font-size: 12px; }
+
+.btn { border: 1px solid var(--border); background: transparent; color: var(--foreground);
+       border-radius: var(--radius-sm); padding: 7px 14px; font-size: 13px; cursor: pointer; }
+.btn:hover:not(:disabled) { border-color: var(--cyan); }
+.btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.btnPrimary { background: var(--cyan); border-color: var(--cyan); color: #06202a; font-weight: 700; }
+.btnDanger { border-color: var(--danger); color: var(--danger); }
+
+.form { margin-top: 16px; display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; }
+.field { display: flex; flex-direction: column; gap: 6px; font-size: 13px; }
+.field label { color: var(--muted); }
+.field input[type="text"], .field input[type="number"] {
+  background: var(--background); border: 1px solid var(--border); color: var(--foreground);
+  border-radius: var(--radius-sm); padding: 8px 10px; font-size: 14px; width: 100%;
+}
+.checkRow { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+.hourRow { display: flex; align-items: center; gap: 8px; }
+.hourRow input { width: 80px; }
+
+.picker { margin-top: 14px; border-top: 1px solid var(--border); padding-top: 14px; }
+.pickerGrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 8px; margin-top: 10px; }
+.pickerItem { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+
+.error { color: var(--danger); font-size: 13px; margin-top: 10px; }
+.ok { color: var(--success); font-size: 13px; margin-top: 10px; }
+
+.badge { font-size: 11px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); }
+.badgeOn { color: var(--success); border-color: var(--success); }
+.badgeOff { color: var(--muted); }
+
+.unassigned { border-color: var(--warning); }
+.unassignedHead { color: var(--warning); font-weight: 700; font-size: 15px; }

@@ -1,0 +1,20 @@
+[Unit]
+Description=TTSLiveTool progress digest notifier (Chatwork, per group)
+Documentation=file:/root/TTSLiveTool/ops/progress_notifier.py
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/TTSLiveTool
+EnvironmentFile=/etc/tts-notify.env
+# backfill-hours 3: VPS再起動等で取りこぼした窓を最大3時間分さかのぼって
+# 補完する。送信済みは UNIQUE(group_id, window_start) で弾かれるので、
+# 何度実行しても二重送信にはならない。
+ExecStart=/root/TTSLiveTool/.venv/bin/python /root/TTSLiveTool/ops/progress_notifier.py \
+  --db-path /root/TTSLiveTool/data/proxy_pool_trial/proxy5.db \
+  --backfill-hours 3
+StandardOutput=append:/var/log/tts-notify.log
+StandardError=append:/var/log/tts-notify.log
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

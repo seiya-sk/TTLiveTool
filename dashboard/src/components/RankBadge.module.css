@@ -1,0 +1,32 @@
+.plain {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.medal {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 999px;
+  font-weight: 700;
+  font-size: 0.82rem;
+  color: #1a1206;
+}
+
+.rank1 {
+  background: linear-gradient(160deg, #ffe27a, #d4a017);
+}
+
+.rank2 {
+  background: linear-gradient(160deg, #e7ecf2, #a9b3bf);
+}
+
+.rank3 {
+  background: linear-gradient(160deg, #e3a97a, #a86a3d);
+}

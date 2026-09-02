@@ -1,0 +1,30 @@
+# --- 認証情報(絶対にコミットしない)-----------------------------------------
+# プロキシの ID/パスワードが平文で入っている。これが履歴に一度でも入ると
+# rebase なしには消せないので、除外はホワイトリストではなく明示で二重に書く。
+sample/proxy_http_auth.txt
+data/proxy_pool_trial/proxy5_ips.txt
+*.env
+.env*
+
+# --- 実データ(9.4GB。コードのバックアップが目的なので入れない)---------------
+data/
+!data/.gitkeep
+
+# --- 依存・生成物 -----------------------------------------------------------
+.venv/
+__pycache__/
+*.py[cod]
+node_modules/
+dashboard/.next/
+dashboard/out/
+dashboard/node_modules/
+
+# --- ログ・一時ファイル -----------------------------------------------------
+*.log
+*.log.gz
+*.jsonl.bak
+*.db
+*.db-wal
+*.db-shm
+*.partial
+*.slim

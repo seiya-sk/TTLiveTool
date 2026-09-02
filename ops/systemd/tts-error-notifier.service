@@ -1,0 +1,15 @@
+[Unit]
+Description=TTSLiveTool error notifier (Chatwork, error room)
+Documentation=file:/root/TTSLiveTool/ops/error_notifier.py
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/TTSLiveTool
+EnvironmentFile=/etc/tts-notify.env
+ExecStart=/root/TTSLiveTool/.venv/bin/python /root/TTSLiveTool/ops/error_notifier.py
+StandardOutput=append:/var/log/tts-notify.log
+StandardError=append:/var/log/tts-notify.log
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

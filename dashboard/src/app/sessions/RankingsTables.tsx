@@ -3,11 +3,11 @@
 import Link from "next/link";
 import { sessionDetailHref, type SessionOrigin } from "@/lib/backLink";
 import { Avatar } from "@/components/Avatar";
-import { DataTable, type Column } from "@/components/DataTable";
+import { DataTable, type Column, type RowRankMeta } from "@/components/DataTable";
 import { RankBadge } from "@/components/RankBadge";
 import { StatusBadge } from "@/components/StatusBadge";
 import Tabs, { type TabDef } from "@/components/Tabs";
-import { CoinIcon, PeopleIcon, UserIcon } from "@/components/icons";
+import { ClockIcon, CoinIcon, PeopleIcon, UserIcon } from "@/components/icons";
 import { avatarUrl, formatDuration, formatJst, formatNumber } from "@/lib/format";
 import type { SessionRankingRow } from "@/lib/queries";
 
@@ -23,7 +23,7 @@ const makeColumns = (linkFrom: SessionOrigin): Column<SessionRankingRow>[] => [
     key: "rank",
     label: "順位",
     accessor: () => null,
-    render: (_r, index) => <RankBadge index={index} />,
+    render: (_r, _index, meta) => <RankBadge rank={meta.rank} ranked={meta.ranked} />,
     width: "56px",
   },
   {
@@ -32,7 +32,7 @@ const makeColumns = (linkFrom: SessionOrigin): Column<SessionRankingRow>[] => [
     accessor: (r) => r.streamerName,
     searchable: true,
     filterable: true,
-    render: (r, index) => (
+    render: (r, _index, meta) => (
       <span className="ranking-name-cell">
         {/* Row navigates to the session (rowHref below); the name itself
             navigates to the streamer's own page instead, so it needs to
@@ -45,7 +45,11 @@ const makeColumns = (linkFrom: SessionOrigin): Column<SessionRankingRow>[] => [
           <Avatar name={r.streamerName} src={avatarUrl(r.avatarPath)} size={32} />
           {r.streamerName}
         </Link>
-        {index === 0 && <StatusBadge label="TOP" tone="pink" />}
+        {/* 「TOP」は1位の目印。**順位として意味がある並びのときだけ**出す
+            (meta.ranked)。日時順や昇順では先頭行は1位ではないので、
+            付けると誤解を招く -- 実際、獲得ダイヤの昇順で0ダイヤの行に
+            付いていた。 */}
+        {meta.ranked && meta.rank === 1 && <StatusBadge label="TOP" tone="pink" />}
       </span>
     ),
   },
@@ -100,9 +104,11 @@ const makeColumns = (linkFrom: SessionOrigin): Column<SessionRankingRow>[] => [
   },
 ];
 
-// #1 by whatever the active tab is currently sorted by gets a soft pink
-// highlight, matching the mock's row emphasis.
-const rowClassName = (_row: SessionRankingRow, index: number) => (index === 0 ? "ranking-row-top" : undefined);
+// 1位の行だけ淡いピンクで強調する。**「上位ほど良い」並びのときだけ**
+// 出す(meta.ranked)。昇順や日時での並べ替えでは、先頭行は1位ではなく
+// 単に先頭なので、強調すると誤解を招く。
+const rowClassName = (_row: SessionRankingRow, _index: number, meta: RowRankMeta) =>
+  meta.ranked && meta.rank === 1 ? "ranking-row-top" : undefined;
 
 export function RankingsTables({
   rows,
@@ -118,6 +124,28 @@ export function RankingsTables({
   const emptyMessage = "配信記録がありません。";
 
   const tabs: TabDef[] = [
+    {
+      // 既定タブ。ホームの「直近の配信」から「すべて見る」で来たときに、
+      // いきなりダイヤランキングに着地しないようにするための入口。
+      //
+      // 並び順はホームと **同じクエリ・同じ並び**(getSessionRankings の
+      // ORDER BY ls.started_at DESC)にそろえる。ホームは同じ結果の先頭7件を
+      // 出しているだけなので、ここが違うと「同じ名前の別物」になる。
+      key: "recent",
+      label: "直近のライブ",
+      icon: <ClockIcon size={16} />,
+      accent: "cyan",
+      content: (
+        <DataTable
+          rows={rows}
+          columns={columns}
+          defaultSort={{ key: "startedAt", dir: "desc" }}
+          rowHref={rowHref}
+          rowClassName={rowClassName}
+          emptyMessage={emptyMessage}
+        />
+      ),
+    },
     {
       key: "diamonds",
       label: "ダイヤランキング",

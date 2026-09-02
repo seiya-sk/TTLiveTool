@@ -13,7 +13,7 @@ const columns: Column<StreamerRow>[] = [
     key: "rank",
     label: "順位",
     accessor: () => null,
-    render: (_r, index) => <RankBadge index={index} />,
+    render: (_r, _index, meta) => <RankBadge rank={meta.rank} ranked={meta.ranked} />,
     width: "56px",
   },
   {
@@ -21,13 +21,16 @@ const columns: Column<StreamerRow>[] = [
     label: "ライバー名",
     accessor: (r) => r.name,
     searchable: true,
-    render: (r, index) => (
+    render: (r, _index, meta) => (
       <span className="streamer-name-cell">
         <Avatar name={r.name} src={avatarUrl(r.avatarPath)} size={36} />
         <span className="streamer-name-cell-text">
           <span>
             {r.name}
-            {index === 0 && r.totalDiamonds > 0 && <StatusBadge label="TOP" tone="pink" />}
+            {/* ライブ一覧と同じ扱い: 順位として意味がある並びのときだけ出す */}
+            {meta.ranked && meta.rank === 1 && r.totalDiamonds > 0 && (
+              <StatusBadge label="TOP" tone="pink" />
+            )}
           </span>
           <span className="streamer-name-handle">@{r.tiktokAccountId}</span>
         </span>
@@ -94,7 +97,8 @@ export function StreamersTable({ rows }: { rows: StreamerRow[] }) {
       columns={columns}
       defaultSort={{ key: "totalDiamonds", dir: "desc" }}
       rowHref={(r) => `/streamers/${r.tiktokAccountId}`}
-      rowClassName={(_r, index) => (index === 0 ? "streamer-row-top" : undefined)}
+      // ライブ一覧と同じ扱い: 「上位ほど良い」並びのときだけ1位を強調する
+      rowClassName={(_r, _index, meta) => (meta.ranked && meta.rank === 1 ? "streamer-row-top" : undefined)}
       emptyMessage="登録されたライバーがいません。"
     />
   );

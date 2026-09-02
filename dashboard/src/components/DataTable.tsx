@@ -3,14 +3,32 @@
 import { useRouter } from "next/navigation";
 import { useMemo, useState, type ReactNode } from "react";
 
+/**
+ * 行に付随する順位の情報。
+ *
+ * rank は **いま表示されている並びに対する順位** で、同値は同順位になる
+ * (次の値は飛ぶ: 1, 1, 3)。並べ替えの基準列で値が等しい行に別々の番号を
+ * 振ると、実データでは意味のない差を見せてしまう -- 実測(2026-09-02)で
+ * 新規フォロワーは93%の行が他の行と同値、うち22行が0だった。
+ *
+ * ranked は「上位ほど良い並びか」。数値列を降順に並べているときだけ true。
+ * 昇順や名前・日時での並べ替えでは false になり、メダルや「TOP」の強調を
+ * 出さない -- 最高同接の昇順で最下位の行に金メダルが付くのは明確な誤解を
+ * 招く(実際にそうなっていた)。
+ */
+export type RowRankMeta = {
+  rank: number;
+  ranked: boolean;
+};
+
 export type Column<T> = {
   key: string;
   label: string;
   accessor: (row: T) => string | number | null;
-  // index is the row's position in the current sorted+filtered view (0 =
-  // top) -- lets a ranking column render "current rank", not a stored
-  // field. Existing render(row) callbacks stay valid (extra param ignored).
-  render?: (row: T, index: number) => ReactNode;
+  // index は現在の並びでの位置(0 = 先頭)。順位そのものは meta.rank を使う
+  // (同順位を扱うため index とは一致しないことがある)。
+  // 既存の render(row) / render(row, index) はそのまま有効。
+  render?: (row: T, index: number, meta: RowRankMeta) => ReactNode;
   align?: "left" | "right";
   // Participates in the free-text search box.
   searchable?: boolean;
@@ -56,7 +74,7 @@ export function DataTable<T>({
   rowHref?: (row: T) => string;
   // Extra class(es) for one row (e.g. highlighting the #1 rank) -- appended
   // to the existing row-link class, never replaces it.
-  rowClassName?: (row: T, index: number) => string | undefined;
+  rowClassName?: (row: T, index: number, meta: RowRankMeta) => string | undefined;
 }) {
   const router = useRouter();
   const [search, setSearch] = useState("");
@@ -123,6 +141,38 @@ export function DataTable<T>({
     setPrevResetSignature(resetSignature);
     setVisibleCount(PAGE_SIZE);
   }
+
+  // 並べ替え後の順位。同値は同順位にし、次の値で飛ばす(1, 1, 3)。
+  // 並べ替えを解除している間(sort が null)は元の並び順のままなので、
+  // 順位ではなく単なる通し番号として 1 から振る。
+  const ranks = useMemo(() => {
+    const col = sort ? columns.find((c) => c.key === sort.key) : undefined;
+    if (!col) return sorted.map((_, i) => i + 1);
+    const out: number[] = [];
+    let previous: string | number | null = null;
+    let previousRank = 0;
+    sorted.forEach((row, i) => {
+      const value = col.accessor(row);
+      if (i > 0 && compareValues(value, previous) === 0) {
+        out.push(previousRank);
+      } else {
+        out.push(i + 1);
+        previousRank = i + 1;
+      }
+      previous = value;
+    });
+    return out;
+  }, [sorted, sort, columns]);
+
+  // 「上位ほど良い」並びかどうか。数値列の降順のときだけ。名前や日時での
+  // 並べ替え、および昇順では順位の意味が変わるので、装飾を出さない。
+  const ranked = useMemo(() => {
+    if (!sort || sort.dir !== "desc") return false;
+    const col = columns.find((c) => c.key === sort.key);
+    if (!col) return false;
+    const sample = sorted.find((row) => col.accessor(row) !== null);
+    return sample !== undefined && typeof col.accessor(sample) === "number";
+  }, [sort, columns, sorted]);
 
   const visible = sorted.slice(0, visibleCount);
 
@@ -214,13 +264,14 @@ export function DataTable<T>({
             <tbody>
               {visible.map((row, i) => {
                 const href = rowHref?.(row);
-                const extraClass = rowClassName?.(row, i);
+                const meta: RowRankMeta = { rank: ranks[i] ?? i + 1, ranked };
+                const extraClass = rowClassName?.(row, i, meta);
                 const className = [href ? "data-table-row-link" : undefined, extraClass].filter(Boolean).join(" ") || undefined;
                 return (
                   <tr key={i} className={className} onClick={href ? () => router.push(href) : undefined}>
                     {columns.map((col) => (
                       <td key={col.key} className={col.align === "right" ? "col-right" : undefined}>
-                        {col.render ? col.render(row, i) : (col.accessor(row) ?? "-")}
+                        {col.render ? col.render(row, i, meta) : (col.accessor(row) ?? "-")}
                       </td>
                     ))}
                   </tr>

@@ -123,9 +123,9 @@ export default async function HomePage(props: PageProps<"/">) {
         />
         <KpiCard
           accent="pink"
-          label="総配信数"
+          label="総ライブ数"
           value={sessionCount}
-          caption={`今月 ${overview.sessionCount}配信`}
+          caption={`今月 ${overview.sessionCount}件`}
           href="/sessions"
         />
       </div>
@@ -133,13 +133,13 @@ export default async function HomePage(props: PageProps<"/">) {
       <div className="home-main-row">
         <section className="home-panel">
           <div className="home-panel-header">
-            <h2 className="home-panel-title">直近の配信</h2>
+            <h2 className="home-panel-title">直近のライブ</h2>
             <Link href="/sessions" className="home-panel-link">
               すべて見る →
             </Link>
           </div>
           {recentSessions.length === 0 ? (
-            <p className="empty">まだ記録された配信がありません。</p>
+            <p className="empty">まだ記録されたライブがありません。</p>
           ) : (
             <table className="recent-sessions-table">
               <thead>

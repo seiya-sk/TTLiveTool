@@ -71,7 +71,7 @@ export default async function StreamerDetailPage(props: PageProps<"/streamers/[a
             icon={<CoinIcon size={16} />}
             accent="pink"
           />
-          <KpiCard label="配信数" value={formatNumber(streamer.sessionCount)} icon={<PlayIcon size={16} />} accent="cyan" />
+          <KpiCard label="ライブ数" value={formatNumber(streamer.sessionCount)} icon={<PlayIcon size={16} />} accent="cyan" />
           <KpiCard label="平均同接" value={formatNumber(avgViewers)} icon={<PeopleIcon size={16} />} accent="purple" />
           <KpiCard label="最高同接" value={formatNumber(maxViewers)} icon={<PeopleIcon size={16} />} accent="cyan" />
           <KpiCard label="直近配信日" value={formatJst(streamer.lastSessionAt)} icon={<ClockIcon size={16} />} accent="muted" />
@@ -86,7 +86,7 @@ export default async function StreamerDetailPage(props: PageProps<"/streamers/[a
           今は何も表示しない(空の操作エリアを見せない)。 */}
 
       <section className="streamer-detail-sessions">
-        <h2>配信一覧</h2>
+        <h2>ライブ一覧</h2>
         <RankingsTables rows={sessions} linkFrom="streamer" />
       </section>
     </div>

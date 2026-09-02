@@ -121,11 +121,11 @@ export function RankingsTables({
 }) {
   const rowHref = (r: SessionRankingRow) => sessionDetailHref(r.id, linkFrom);
   const columns = makeColumns(linkFrom);
-  const emptyMessage = "配信記録がありません。";
+  const emptyMessage = "ライブの記録がありません。";
 
   const tabs: TabDef[] = [
     {
-      // 既定タブ。ホームの「直近の配信」から「すべて見る」で来たときに、
+      // 既定タブ。ホームの「直近のライブ」から「すべて見る」で来たときに、
       // いきなりダイヤランキングに着地しないようにするための入口。
       //
       // 並び順はホームと **同じクエリ・同じ並び**(getSessionRankings の

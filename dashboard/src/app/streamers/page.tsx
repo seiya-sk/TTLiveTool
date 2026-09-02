@@ -83,9 +83,9 @@ export default function StreamersPage() {
         <KpiCard
           accent="pink"
           icon={<PlayIcon size={16} />}
-          label="総配信数"
+          label="総ライブ数"
           value={sessionCount}
-          caption={`今月 ${overview.sessionCount}配信`}
+          caption={`今月 ${overview.sessionCount}件`}
         />
         <KpiCard
           accent="pink"

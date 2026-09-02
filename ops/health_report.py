@@ -10,6 +10,7 @@
   3. 新ロジックの検証     -- セッション分割の根絶 / 終了種別 / IP乗り換え
   4. 署名消費ペース       -- 枯渇の安全域に留まっているか
   5. データ取得の欠測     -- 原因を問わず「取れていない」時間帯を数える
+  6. 録画枠の不足         -- 枠が足りずに録り逃した配信(必要IP数の根拠)
 
 ベースラインには「時間別エラー率の中央値」を使う。単純な平均だと、
 2026-09-01 16:50 のような10分間のスパイク(VPSのリソース競合が原因で、
@@ -68,6 +69,9 @@ BLACKOUT_MERGE_MIN = 15          # この間隔までは同じ1件の障害と�
 
 SIGNATURE_DAY_MAX = 100
 SIGNATURE_WARN_REMAINING_PCT = 30   # 残り30%を切ったら警告
+# 枠不足の報告で「必要IP数」を出すときに足す予約枠(録画に使わない本数)。
+RESERVED_SLOTS_HINT = 1
+
 RATE_LIMIT_URL = "https://api.eulerstream.com/webcast/rate_limits"
 
 
@@ -502,6 +506,123 @@ def report_blackouts(db_path: str, events: list[dict], since: datetime) -> dict:
     }
 
 
+def _time_at_capacity(events: list[dict]) -> tuple[float, int]:
+    """録画本数が上限に張り付いていた合計秒数と、その上限本数を返す。
+
+    recording_started / recording_ended から本数を復元する。枠不足の記録が
+    0件だったときに「本当に不足しなかった」のか「記録できていなかった」のかを
+    分けるために使う。
+    """
+    marks = sorted(
+        (e["timestamp"], e["event"]) for e in events
+        if e.get("event") in ("recording_started", "recording_ended")
+    )
+    capacity = max((e.get("max_recording_slots") or 0) for e in events
+                   if e.get("event") == "slot_shortage") if any(
+        e.get("event") == "slot_shortage" for e in events) else 0
+    if not capacity:
+        # 記録が無ければ、観測された同時録画数の最大を上限とみなす
+        n = peak = 0
+        for _, kind in marks:
+            n += 1 if kind == "recording_started" else -1
+            n = max(0, n)
+            peak = max(peak, n)
+        capacity = peak
+    if capacity <= 0:
+        return 0.0, 0
+    n = 0
+    since = None
+    total = 0.0
+    for ts, kind in marks:
+        n += 1 if kind == "recording_started" else -1
+        n = max(0, n)
+        if n >= capacity and since is None:
+            since = _jst(ts)
+        elif n < capacity and since is not None:
+            total += (_jst(ts) - since).total_seconds()
+            since = None
+    return total, capacity
+
+
+def report_slot_shortage(events: list[dict]) -> dict:
+    """録画枠が足りずに録り逃した配信を数える。**必要IP数の見積もりに使う。**
+
+    数えるのは「is_live=True なのに空き枠が無かった」場合だけ。接続失敗や
+    クールダウン中の見送りは原因が違うので混ぜない(混ぜると必要IP数を
+    過大に見積もる)。
+
+    「同時に配信していた推定人数」= その時点の録画本数 + 枠不足で見送った
+    人数。録画中の本数だけを見ていると枠の上限で頭打ちになり、実際に何人が
+    同時に配信していたかが分からない。上限に張り付いている限り、
+    「本当は何本必要だったか」はこの指標でしか出てこない。
+    """
+    section("6. 録画枠の不足(必要IP数の見積もり)")
+    shortages = [e for e in events if e.get("event") == "slot_shortage"]
+
+    # 「枠不足が無かった」のか「枠不足を記録できていなかった」のかを区別する。
+    # slot_shortage の記録は 2026-09-02 に追加した機能で、それ以前の期間は
+    # 上限に張り付いていても記録が残らない(当時は満杯の間 is_live チェック
+    # 自体を止めていたため、遡って再構成することもできない)。
+    # 記録が0件でも、上限に到達した形跡があるなら「不足なし」とは言えない。
+    at_capacity_sec, capacity = _time_at_capacity(events)
+
+    if not shortages:
+        if at_capacity_sec > 0:
+            print(f"\n  ★ 記録は0件だが、録画枠の上限({capacity}本)に張り付いていた時間が"
+                  f" {at_capacity_sec / 60:.0f}分ある。")
+            print("     その間に配信していたライバーがいたかは **判定できない**"
+                  " -- 満杯中の巡回記録が無い期間(機能追加前)。")
+            print("     機能追加後の期間で再度確認すること。")
+        else:
+            print("\n  枠不足なし ✓(録画枠が上限に達した時間帯そのものが無い)")
+        return {"count": 0, "streamers": [], "peak_concurrent_estimate": 0,
+                "at_capacity_sec": at_capacity_sec, "measurable": at_capacity_sec == 0}
+
+    total = len(shortages) + sum(e.get("suppressed", 0) for e in shortages)
+    by_user = collections.Counter()
+    for e in shortages:
+        by_user[e.get("username")] += 1 + e.get("suppressed", 0)
+
+    # 同時配信人数の推定: 近接した見送りをまとめ、その時点の録画本数に足す
+    peak = 0
+    peak_at = None
+    peak_detail = None
+    window = []      # (時刻, username, active_count)
+    for e in sorted(shortages, key=lambda x: x["timestamp"]):
+        t = _jst(e["timestamp"])
+        window = [w for w in window if (t - w[0]).total_seconds() <= 300]
+        window.append((t, e.get("username"), e.get("active_count", 0)))
+        est = max(w[2] for w in window) + len({w[1] for w in window})
+        if est > peak:
+            peak, peak_at, peak_detail = est, t, (max(w[2] for w in window),
+                                                  len({w[1] for w in window}))
+
+    print(f"\n  発生回数: {total}回(記録 {len(shortages)}件 + まとめられた {total - len(shortages)}件)")
+    print(f"  影響を受けたライバー: {len(by_user)}人")
+    slots = shortages[0].get("max_recording_slots")
+    print(f"  現在の録画枠: {slots}本(IP {shortages[0].get('total_slots')}本 - 予約)")
+    if peak_at:
+        print(f"\n  同時に配信していた推定人数の最大: {peak}人  ({peak_at:%m-%d %H:%M} JST)")
+        print(f"    内訳: 録画中 {peak_detail[0]}本 + 枠不足で見送り {peak_detail[1]}人")
+        if slots and peak > slots:
+            print(f"    ★ 全員を録るには少なくとも {peak}枠 = IP {peak + RESERVED_SLOTS_HINT}本 が要る")
+
+    print(f"\n  --- 影響を受けたライバー(見送り回数の多い順) ---")
+    for name, n in by_user.most_common(20):
+        print(f"    @{name:<24} {n:>4}回")
+    if len(by_user) > 20:
+        print(f"    ... 他 {len(by_user) - 20}人")
+
+    return {
+        "count": total,
+        "logged": len(shortages),
+        "streamers": [{"username": n, "skipped": c} for n, c in by_user.most_common()],
+        "peak_concurrent_estimate": peak,
+        "peak_at": peak_at.isoformat() if peak_at else None,
+        "recording_slots": slots,
+    }
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--db-path", default="data/proxy_pool_trial/proxy5.db")
@@ -530,6 +651,7 @@ def main() -> int:
         "handoffs": report_handoffs(events),
         "signatures": report_signatures(events, args.proxies_file),
         "blackouts": report_blackouts(args.db_path, events, since),
+        "slot_shortage": report_slot_shortage(events),
     }
 
     if args.json:

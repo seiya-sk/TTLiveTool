@@ -128,6 +128,21 @@ MAX_STALL_RECONNECTS_PER_SESSION = 1    # 1セッションにつき1回まで
 MAX_STALL_RECONNECT_RETRIES = 2         # その1回の中でのリトライ上限
 STALL_RECONNECT_COOLDOWN_SEC = 1800.0   # 30分。連続で繋ぎ直さない
 
+# --- 録画枠の不足(2026-09-02)-----------------------------------------------
+# 全録画枠が埋まっている間、巡回ループは **is_live チェックすら行わずに
+# 眠っていた**。そのため「枠が足りずに録り逃した配信」が1件も記録されず、
+# 過去ログから遡って再構成することもできない(チェック自体が走っていない
+# ので、誰が配信していたかの記録が存在しない)。
+#
+# 実測(2026-09-01): 上限9本の状態が合計351分(5.9時間)あり、その間に
+# 実行された巡回チェックはわずか2件。通常ペースなら約4,213件に相当する。
+# 最長の連続区間は51分。必要IP数を見積もる材料が丸ごと欠けていた。
+#
+# is_live チェックは署名を消費しないので、枠が無くても続けてよい。
+# 予約枠(RESERVED_CHECK_SLOTS)は録画に使わないので必ず1本空いており、
+# それを使って「本当は録りたかった配信」を数える。
+SLOT_SHORTAGE_LOG_INTERVAL_SEC = 300.0   # 同一ライバーの連続見送りをまとめる間隔
+
 # --- 初回接続のリトライ上限(2026-09-02)-------------------------------------
 # **ストール再接続(MAX_STALL_RECONNECT_RETRIES)とは別の経路**。
 # あちらは「一度は繋がって録れていたセッションが無音になった」ときの繋ぎ直し。
@@ -348,6 +363,9 @@ class ProxyPoolTrial:
         self._quarantined: set[str] = set()
         # 初回接続の門番(ストールガードとは独立。上のクラスの docstring 参照)
         self._connect_gate = InitialConnectGate()
+        # 枠不足で見送ったライバー -> (最後に記録した時刻, まとめた回数)
+        self._shortage_last_log: dict[str, float] = {}
+        self._shortage_pending: collections.Counter = collections.Counter()
         self._trial_started_at = time.monotonic()
         self.max_concurrent_seen = 0
 
@@ -570,11 +588,68 @@ class ProxyPoolTrial:
         logger.info("@%s is live -- recording via ip#%d (active=%d)", username, slot.index, active_count)
         slot.task = asyncio.create_task(self._run_recording(slot))
 
+    async def _scan_while_full(self) -> None:
+        """録画枠が満杯のあいだも巡回を続け、録り逃した配信を記録する。
+
+        **記録するのは「is_live=True なのに空き枠が無かった」場合だけ**。
+        接続失敗・初回接続のクールダウン中・隔離中の見送りは原因がまったく
+        違うので、混ぜない -- 混ぜると必要IP数の見積もりを誤る。
+        クールダウン中/隔離中のライバーは _next_candidate_username() が
+        そもそも返さないので、ここに来る時点で除外済み。
+        """
+        check_slot = self._borrow_check_slot()
+        username = self._next_candidate_username()
+        if check_slot is None or username is None:
+            # 予約枠まで埋まっている(通常は起きない)。確認する手段が無い。
+            await asyncio.sleep(IDLE_WAIT_SEC)
+            return
+        try:
+            proxy_config = proxy_module.parse_proxy_url(check_slot.proxy_url)
+        except ValueError:
+            await asyncio.sleep(IDLE_WAIT_SEC)
+            return
+        web_proxy = proxy_module.build_httpx_proxy(proxy_config)
+
+        status = await self.pacer.check_status(username, web_proxy=web_proxy)
+        if status != watch_module.LIVE:
+            return      # 配信していないなら枠不足の被害ではない
+
+        active = sum(1 for s in self.slots if s.in_use)
+        now = time.monotonic()
+        last = self._shortage_last_log.get(username, 0.0)
+        if now - last < SLOT_SHORTAGE_LOG_INTERVAL_SEC:
+            # 同一ライバーは巡回のたびに何度も引っかかる。毎回書くと
+            # ログが溢れて他が読めなくなるので、数だけ積んでおく。
+            self._shortage_pending[username] += 1
+            return
+        suppressed = self._shortage_pending.pop(username, 0)
+        self._shortage_last_log[username] = now
+        self._log(
+            "slot_shortage",
+            username=username,
+            check_via=_masked(check_slot.proxy_url),
+            active_count=active,
+            max_recording_slots=len(self.slots) - self._reserved_slots(),
+            total_slots=len(self.slots),
+            suppressed=suppressed,
+        )
+        logger.warning(
+            "@%s is live but every recording slot is busy (%d/%d in use) -- not recording%s",
+            username, active, len(self.slots) - self._reserved_slots(),
+            f" (+{suppressed} more skipped since the last note)" if suppressed else "",
+        )
+
     async def run_forever(self) -> None:
         while True:
             slot = self._next_recording_slot()
-            username = self._next_candidate_username() if slot else None
-            if slot is None or username is None:
+            if slot is None:
+                # 録画枠が無い。**ここで眠らずに巡回だけ続ける** --
+                # 「枠が足りずに録り逃した配信」を数えるため。
+                # is_live チェックは署名を消費しないので枠が無くても行える。
+                await self._scan_while_full()
+                continue
+            username = self._next_candidate_username()
+            if username is None:
                 await asyncio.sleep(IDLE_WAIT_SEC)
                 continue
 

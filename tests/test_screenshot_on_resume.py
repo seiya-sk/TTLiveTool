@@ -211,3 +211,51 @@ def test_run_trial_sh_unsets_the_disable_flag():
     """
     script = (Path(__file__).resolve().parents[1] / "run_trial.sh").read_text(encoding="utf-8")
     assert "unset TTS_DISABLE_SCREENSHOTS" in script
+
+
+# --- 5. 一斉撮影でメモリを食い潰さないこと ---------------------------------
+def test_captures_are_serialised(tmp_path):
+    """撮影は同時に走らない。
+
+    ヘッドレス Chromium は実測373MB(空ページ)常駐し、このVPSの実質空きは
+    約2GB。「再開時に経過済みなら即撮る」を入れたことで、再起動直後に
+    録画中の全セッションが一斉に撮ろうとする経路ができた。9本同時なら
+    OOM killer が走り、**最大のプロセスである録画本体が殺される**。
+    写真1枚のために録画を落とすのは本末転倒なので直列化する。
+    """
+    from tiktok_monitor import screenshot as sm
+
+    peak = {"n": 0, "cur": 0}
+
+    async def fake_capture(username, output_path, proxy_url=None):
+        peak["cur"] += 1
+        peak["n"] = max(peak["n"], peak["cur"])
+        await asyncio.sleep(0.05)
+        peak["cur"] -= 1
+        return True
+
+    async def scenario():
+        with patch.object(sm, "_capture_one", side_effect=fake_capture):
+            await asyncio.gather(*[
+                sm.capture_live_screenshot(f"user{i}", str(tmp_path / f"{i}.png"))
+                for i in range(9)
+            ])
+
+    asyncio.run(scenario())
+    assert peak["n"] <= sm.MAX_CONCURRENT_CAPTURES, \
+        f"同時に{peak['n']}本走った(上限{sm.MAX_CONCURRENT_CAPTURES})"
+
+
+def test_semaphore_survives_a_new_event_loop(tmp_path):
+    """モジュール直下でセマフォを1個使い回すと、別ループで待機したときに
+    壊れる。ループが変わったら作り直していることを固定する。"""
+    from tiktok_monitor import screenshot as sm
+
+    async def scenario():
+        async with sm._get_capture_semaphore():
+            pass
+        return sm._get_capture_semaphore()
+
+    first = asyncio.run(scenario())
+    second = asyncio.run(scenario())
+    assert first is not second, "前のループのセマフォを使い回している"

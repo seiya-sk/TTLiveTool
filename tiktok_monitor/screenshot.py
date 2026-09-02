@@ -8,6 +8,7 @@ toast overlaid near the bottom of the player; rather than chase that toast's
 unstable, undocumented DOM structure with click-to-dismiss selectors, the
 capture clips it out by cropping the bottom margin of the video frame.
 """
+import asyncio
 import logging
 import os
 from datetime import datetime, timezone
@@ -41,6 +42,41 @@ FRAME_SETTLE_MS = 2500
 # video element; crop it out rather than try to click-dismiss it.
 BOTTOM_CROP_RATIO = 0.85
 
+# --- 同時撮影数の上限(2026-09-02)-------------------------------------------
+# ヘッドレス Chromium は1本で **373MB** 常駐する(実測、空ページ。実際の
+# ライブページは動画デコードを伴うのでさらに増える)。このVPSは総メモリ3GB、
+# 実質の空きが約2GBしかない。
+#
+# 撮影は本来ばらけている(各セッションが自分の開始時刻から10分後に1枚)。
+# しかし再開時に「開始から10分以上経っていれば即座に撮る」ようにしたことで、
+# **再起動直後に録画中の全セッションが一斉に撮ろうとする**経路ができた。
+# 9本同時なら3GB超を要求し、OOM killer が走る。最大のプロセスは録画本体
+# なので、真っ先に殺されるのは録画である -- 撮れなかった写真1枚のために
+# 録画を落とすのは本末転倒。
+#
+# 撮影に時間的な締切は無いので、直列化して順番待ちさせる。1本あたり最長
+# 25秒程度(VIDEO_WAIT_MS + FRAME_SETTLE_MS + 起動)なので、9本待っても
+# 4分程度で片付く。
+MAX_CONCURRENT_CAPTURES = 1
+
+_capture_semaphore: "asyncio.Semaphore | None" = None
+_capture_semaphore_loop = None
+
+
+def _get_capture_semaphore() -> "asyncio.Semaphore":
+    """実行中のイベントループに紐づくセマフォを返す。
+
+    モジュール直下で1個作って使い回すと、別のループ(テストの asyncio.run が
+    毎回新しく作る)で待機したときに壊れる。ループが変わったら作り直す。
+    """
+    global _capture_semaphore, _capture_semaphore_loop
+    loop = asyncio.get_running_loop()
+    if _capture_semaphore is None or _capture_semaphore_loop is not loop:
+        _capture_semaphore = asyncio.Semaphore(MAX_CONCURRENT_CAPTURES)
+        _capture_semaphore_loop = loop
+    return _capture_semaphore
+
+
 
 async def capture_live_screenshot(username: str, output_path: str, proxy_url: str | None = None) -> bool:
     """Best-effort: opens the LIVE viewer page anonymously and saves a
@@ -51,6 +87,11 @@ async def capture_live_screenshot(username: str, output_path: str, proxy_url: st
     proxy_url is optional (Phase 5 IP-based measurement prep) -- None
     connects with the real IP exactly as before this parameter existed;
     see proxy.py for the supported URL shape."""
+    async with _get_capture_semaphore():
+        return await _capture_one(username, output_path, proxy_url)
+
+
+async def _capture_one(username: str, output_path: str, proxy_url: str | None = None) -> bool:
     directory = os.path.dirname(output_path)
     if directory:
         os.makedirs(directory, exist_ok=True)

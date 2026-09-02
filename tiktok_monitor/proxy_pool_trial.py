@@ -588,6 +588,45 @@ class ProxyPoolTrial:
         logger.info("@%s is live -- recording via ip#%d (active=%d)", username, slot.index, active_count)
         slot.task = asyncio.create_task(self._run_recording(slot))
 
+    def _handle_check_error(self, exc: Exception, ip_index: int,
+                            proxy_url: str, username: str) -> None:
+        """巡回チェックの失敗を記録し、削除済みアカウントを隔離する。
+
+        ディスパッチ経路と満杯時巡回の **両方から呼ぶ**。以前は
+        ディスパッチ経路にしか無く、枠が満杯の間のチェック失敗が
+        まったく記録されなかった -- IP品質の指標(エラー率)が、
+        よりによって混雑時だけ過小評価される状態だった。
+        """
+        # check_is_live() は例外を握りつぶして False を返す。このフックが
+        # 無いと、403やブロックが「単にオフライン」と区別できず、
+        # events.jsonl に痕跡すら残らない。
+        self._log(
+            "check_error",
+            ip_index=ip_index,
+            proxy=_masked(proxy_url),
+            username=username,
+            error=repr(exc),
+        )
+        # 「存在しない/一度も配信していない」は再試行しても直らない。
+        # 規定回数で巡回から外す(プロセス再起動でリセットされる)。
+        if type(exc).__name__ == "UserNotFoundError":
+            self._not_found_counts[username] += 1
+            if (self._not_found_counts[username] >= QUARANTINE_AFTER_NOT_FOUND
+                    and username not in self._quarantined):
+                self._quarantined.add(username)
+                logger.warning(
+                    "quarantining @%s from the scan pool after %d UserNotFoundError(s) "
+                    "-- restart to un-quarantine",
+                    username, self._not_found_counts[username],
+                )
+                self._log("quarantined", username=username,
+                          not_found_count=self._not_found_counts[username],
+                          pool_remaining=len(self.pool) - len(self._quarantined))
+        else:
+            # 別種のエラーなら連続とみなさずリセット(ネットワーク不調で
+            # 隔離してしまわないため)
+            self._not_found_counts.pop(username, None)
+
     async def _scan_while_full(self) -> None:
         """録画枠が満杯のあいだも巡回を続け、録り逃した配信を記録する。
 
@@ -610,7 +649,11 @@ class ProxyPoolTrial:
             return
         web_proxy = proxy_module.build_httpx_proxy(proxy_config)
 
-        status = await self.pacer.check_status(username, web_proxy=web_proxy)
+        status = await self.pacer.check_status(
+            username, web_proxy=web_proxy,
+            on_error=lambda exc: self._handle_check_error(
+                exc, check_slot.index, check_slot.proxy_url, username),
+        )
         if status != watch_module.LIVE:
             return      # 配信していないなら枠不足の被害ではない
 
@@ -680,38 +723,7 @@ class ProxyPoolTrial:
             web_proxy = proxy_module.build_httpx_proxy(proxy_config)
 
             def _on_check_error(exc: Exception, _slot=slot, _username=username) -> None:
-                # check_is_live() swallows every exception itself and always
-                # returns False -- without this hook, a 403/block during the
-                # is_live probe (the far more likely place to hit one, given
-                # this trial's whole point is finding that threshold across
-                # many distinct source IPs) would be indistinguishable from
-                # "genuinely offline" and never show up in events.jsonl at all.
-                self._log(
-                    "check_error",
-                    ip_index=_slot.index,
-                    proxy=_masked(_slot.proxy_url),
-                    username=_username,
-                    error=repr(exc),
-                )
-                # 「存在しない/一度も配信していない」は再試行しても直らない。
-                # 規定回数で巡回から外す(プロセス再起動でリセットされる)。
-                if type(exc).__name__ == "UserNotFoundError":
-                    self._not_found_counts[_username] += 1
-                    if (self._not_found_counts[_username] >= QUARANTINE_AFTER_NOT_FOUND
-                            and _username not in self._quarantined):
-                        self._quarantined.add(_username)
-                        logger.warning(
-                            "quarantining @%s from the scan pool after %d UserNotFoundError(s) "
-                            "-- restart to un-quarantine",
-                            _username, self._not_found_counts[_username],
-                        )
-                        self._log("quarantined", username=_username,
-                                  not_found_count=self._not_found_counts[_username],
-                                  pool_remaining=len(self.pool) - len(self._quarantined))
-                else:
-                    # 別種のエラーなら連続とみなさずリセット(ネットワーク不調で
-                    # 隔離してしまわないため)
-                    self._not_found_counts.pop(_username, None)
+                self._handle_check_error(exc, _slot.index, _slot.proxy_url, _username)
 
             is_live = await self.pacer.check(username, web_proxy=web_proxy, on_error=_on_check_error)
             self._log(

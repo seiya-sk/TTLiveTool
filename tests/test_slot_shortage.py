@@ -235,3 +235,58 @@ def test_scanning_while_full_does_not_take_a_recording_slot(tmp_path):
     after = sum(1 for s in trial.slots if s.in_use)
     assert after == before == 9, f"録画本数が変わった: {before} -> {after}"
     assert trial._borrow_check_slot() is not None, "確認用の空きが無くなった"
+
+
+def test_check_errors_during_full_capacity_are_recorded(tmp_path):
+    """満杯中のチェック失敗も記録すること。
+
+    以前はエラーフックがディスパッチ経路にしか無く、枠が満杯の間の失敗が
+    まったく残らなかった。IP品質の指標(エラー率)が、よりによって
+    混雑時だけ過小評価される状態になる。
+    """
+    from tiktok_monitor import watch as watch_mod
+    import unittest.mock as m
+
+    trial = make_trial(10, status=w.UNKNOWN, tmp_path=tmp_path)
+    trial.pool = ["someone"]
+    fill_recording_slots(trial)
+
+    async def boom(username, web_proxy=None, on_error=None):
+        if on_error:
+            on_error(RuntimeError("ConnectTimeout('')"))
+        return w.UNKNOWN
+
+    async def scenario():
+        with m.patch.object(trial.pacer, "check_status", side_effect=boom):
+            await trial._scan_while_full()
+
+    asyncio.run(scenario())
+
+    errs = [e for e in read_events(trial) if e["event"] == "check_error"]
+    assert len(errs) == 1, "満杯中のチェック失敗が記録されていない"
+    assert errs[0]["username"] == "someone"
+
+
+def test_quarantine_also_works_while_full(tmp_path):
+    """削除済みアカウントの隔離は満杯中でも進むこと。進まないと、
+    混雑時ほど無駄打ちが減らない。"""
+    from TikTokLive.client.errors import UserNotFoundError
+    import unittest.mock as m
+
+    trial = make_trial(10, status=w.UNKNOWN, tmp_path=tmp_path)
+    trial.pool = ["gone"]
+    fill_recording_slots(trial)
+
+    async def missing(username, web_proxy=None, on_error=None):
+        if on_error:
+            on_error(UserNotFoundError("gone"))
+        return w.OFFLINE
+
+    async def scenario():
+        with m.patch.object(trial.pacer, "check_status", side_effect=missing):
+            for _ in range(ppt.QUARANTINE_AFTER_NOT_FOUND):
+                await trial._scan_while_full()
+
+    asyncio.run(scenario())
+
+    assert "gone" in trial._quarantined, "満杯中は隔離が進まない"

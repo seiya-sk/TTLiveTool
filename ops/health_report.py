@@ -9,6 +9,7 @@
   2. 全体ベースライン     -- 平常時が0.5%を超えて定着していないか
   3. 新ロジックの検証     -- セッション分割の根絶 / 終了種別 / IP乗り換え
   4. 署名消費ペース       -- 枯渇の安全域に留まっているか
+  5. データ取得の欠測     -- 原因を問わず「取れていない」時間帯を数える
 
 ベースラインには「時間別エラー率の中央値」を使う。単純な平均だと、
 2026-09-01 16:50 のような10分間のスパイク(VPSのリソース競合が原因で、
@@ -40,6 +41,31 @@ IP_WARN_PCT = 2.0            # 単独IPがこれを超え続けるなら交換�
 # 以前ここには「600回/時」という瞬間レートの危険水準しか無く、日次の累計を
 # 見ていなかった。そのため実際には枯渇していたのに「安全域1.3%」と報告し
 # 続け、2時間半のデータ欠損に気づけなかった。日次残量を直接見るように変更。
+# --- データ取得の欠測(2026-09-02)-------------------------------------------
+# **原因ではなく症状で監視する指標**。
+# 09-01 の署名枯渇(A-1)と上流ネットワーク断(A-3)は原因がまったく違うが、
+# 症状はどちらも「データが取れていない」で共通する。原因ごとに検知を作ると
+# 必ず漏れるので、結果の側に1本置く。
+#
+# 判定の設計は実データで検証して決めた。当初案の
+# 「録画中セッションが1本以上あるのに直近15分のイベントが0件」は、
+# **既知の3件をどれも検知できない**:
+#   - A-1(2時間の全停止)は、そもそも1本も接続できておらず録画中=0本
+#     だった。「録画中が1本以上」という前提が成立しない。
+#   - A-3 の2件は9〜11分と短く、15分窓が完全に0になる瞬間が無い
+#     (窓の前後に正常な分が入る)。しかも完全な0ではなく毎分1〜4件は届いていた。
+# そこで3点に変えた:
+#   1. 窓は5分。9分の断でも窓が丸ごと断の中に入る
+#   2. 0件ではなく「平常(中央値)の5%未満」。細く届き続ける断も拾う
+#   3. 「録画中1本以上」ではなく「録画中1本以上 **または** 巡回で
+#      is_live=True が出ている」。後者が A-1 を拾う唯一の手がかりで、
+#      同時に「誰も配信していないだけの静かな時間帯」を除外する
+#      (実測: A-1 は is_live=True が3回、静かな時間帯は0回)
+BLACKOUT_WINDOW_MIN = 5          # 欠測判定の窓
+BLACKOUT_RATIO = 0.05            # 平常(中央値)のこの割合を下回ったら欠測
+BLACKOUT_CONTEXT_MIN = 60        # 直前この時間に取得実績があること(=動いていた証拠)
+BLACKOUT_MERGE_MIN = 15          # この間隔までは同じ1件の障害としてまとめる
+
 SIGNATURE_DAY_MAX = 100
 SIGNATURE_WARN_REMAINING_PCT = 30   # 残り30%を切ったら警告
 RATE_LIMIT_URL = "https://api.eulerstream.com/webcast/rate_limits"
@@ -348,6 +374,134 @@ def report_signatures(events: list[dict], proxies_file: str) -> dict:
             "api_key_set": bool(api_key), "per_ip": rows}
 
 
+def report_blackouts(db_path: str, events: list[dict], since: datetime) -> dict:
+    """「取れるはずのデータが取れていない」時間帯を、症状として数える。
+
+    判定の根拠と、当初案では検知できなかった理由は BLACKOUT_* の
+    コメントを参照。ここは原因を問わない -- 署名枯渇でもネットワーク断でも
+    プロセス停止でも、結果が同じなら同じように上がる。
+    """
+    section("5. データ取得の欠測(症状ベース / 原因を問わない)")
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    lo_utc = since.astimezone(timezone.utc)
+    per_min: dict[str, int] = {}
+    for m, n in conn.execute(
+        "SELECT substr(occurred_at,1,16), COUNT(*) FROM live_events "
+        "WHERE occurred_at >= ? GROUP BY 1", (lo_utc.isoformat(),)
+    ):
+        per_min[m] = n
+    sessions = conn.execute(
+        "SELECT started_at, ended_at FROM live_sessions WHERE ended_at IS NULL OR ended_at >= ?",
+        (lo_utc.isoformat(),)
+    ).fetchall()
+    conn.close()
+
+    # 巡回で「配信中」と判定された時刻(= 繋ぐべき相手がいた証拠)
+    live_seen: dict[str, int] = collections.Counter()
+    for e in events:
+        if e.get("event") == "check" and e.get("is_live"):
+            live_seen[e["timestamp"][:16]] += 1
+
+    def key(t: datetime) -> str:
+        return t.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M")
+
+    def window(t: datetime, mins: int, table=None) -> int:
+        table = per_min if table is None else table
+        return sum(table.get(key(t - timedelta(minutes=i)), 0) for i in range(mins))
+
+    def recording_at(t: datetime) -> int:
+        s = t.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:00")
+        return sum(1 for a, b in sessions if a <= s and (b is None or b >= s))
+
+    now = datetime.now(JST)
+    minutes = []
+    t = since
+    while t < now:
+        minutes.append(t)
+        t += timedelta(minutes=1)
+    if not minutes:
+        print("\n  対象期間が短すぎます")
+        return {"count": 0, "minutes": 0, "windows": []}
+
+    vals = [window(t, BLACKOUT_WINDOW_MIN) for t in minutes]
+    live_vals = [v for v in vals if v > 0]
+    baseline = statistics.median(live_vals) if live_vals else 0
+    threshold = baseline * BLACKOUT_RATIO
+
+    # 1) まず「取得が止まっている分」を拾う。根拠の判定はまだしない。
+    hits = []
+    for t, v in zip(minutes, vals):
+        if baseline <= 0:
+            break
+        if v >= threshold:
+            continue
+        # 直前に取得実績があったか(= システムは動いていた証拠)
+        if window(t - timedelta(minutes=BLACKOUT_WINDOW_MIN), BLACKOUT_CONTEXT_MIN) <= 0:
+            continue
+        hits.append((t, v))
+
+    # 2) 連続をひとまとまりにする。間隔は BLACKOUT_MERGE_MIN まで許す --
+    #    ここを狭くすると、1件の長い障害が細切れに数えられて「回数」が
+    #    増え「長さ」が失われる(実測: 署名枯渇の72分が2〜5分×4件に割れた)。
+    groups = []
+    for t, v in hits:
+        if groups and (t - groups[-1]["end"]).total_seconds() <= BLACKOUT_MERGE_MIN * 60:
+            groups[-1]["end"] = t
+            groups[-1]["min_events"] = min(groups[-1]["min_events"], v)
+        else:
+            groups.append({"start": t, "end": t, "min_events": v})
+
+    # 3) 「取れるはずだった根拠」は **まとまり単位** で見る。分単位で見ると、
+    #    根拠(is_live=True の巡回)が疎にしか出ない障害が細切れになる。
+    #    根拠が1つも無いまとまりは、単に誰も配信していない静かな時間帯。
+    kept = []
+    for g in groups:
+        rec = 0
+        live_hits = 0
+        # 最終分は除いて数える。復旧した瞬間(録画が再開し、巡回が
+        # is_live=True を返した分)は **障害の証拠ではなく復旧の証拠** で、
+        # これを根拠に数えると「誰も配信していなかっただけの静かな時間帯」が
+        # 復旧時の1回だけを根拠に欠測として上がってしまう(実測で誤検知)。
+        last = g["end"] - timedelta(minutes=1) if g["end"] > g["start"] else g["end"]
+        t = g["start"]
+        while t <= last:
+            rec = max(rec, recording_at(t))
+            live_hits += live_seen.get(key(t), 0)
+            t += timedelta(minutes=1)
+        if rec < 1 and live_hits < 1:
+            continue
+        g["recording"] = rec
+        g["live_seen"] = live_hits
+        kept.append(g)
+    groups = kept
+
+    print(f"\n  平常時の{BLACKOUT_WINDOW_MIN}分あたりイベント数(中央値): {baseline:.0f}")
+    print(f"  欠測とみなす閾値: {threshold:.0f}件未満({BLACKOUT_RATIO:.0%})")
+    print(f"\n  直近{(now - since).total_seconds() / 3600:.0f}時間の発生回数: {len(groups)}回")
+    if groups:
+        print(f"\n  {'開始':<12}{'終了':<9}{'長さ':>6}{'最小窓':>8}{'録画中':>7}{'配信中と判定':>13}")
+        for g in groups:
+            dur = int((g["end"] - g["start"]).total_seconds() // 60) + 1
+            print(f"  {g['start']:%m-%d %H:%M}  {g['end']:%H:%M}  {dur:>4}分{g['min_events']:>8}{g['recording']:>6}本{g['live_seen']:>12}回")
+        total = sum(int((g["end"] - g["start"]).total_seconds() // 60) + 1 for g in groups)
+        print(f"\n  欠測の合計: {total}分")
+    else:
+        print("\n  欠測なし ✓")
+
+    return {
+        "count": len(groups),
+        "minutes": sum(int((g["end"] - g["start"]).total_seconds() // 60) + 1 for g in groups),
+        "baseline": baseline,
+        "windows": [
+            {"start": g["start"].isoformat(), "end": g["end"].isoformat(),
+             "minutes": int((g["end"] - g["start"]).total_seconds() // 60) + 1,
+             "min_events": g["min_events"], "recording": g["recording"],
+             "live_seen": g["live_seen"]}
+            for g in groups
+        ],
+    }
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--db-path", default="data/proxy_pool_trial/proxy5.db")
@@ -375,6 +529,7 @@ def main() -> int:
         "sessions": report_sessions(args.db_path, since),
         "handoffs": report_handoffs(events),
         "signatures": report_signatures(events, args.proxies_file),
+        "blackouts": report_blackouts(args.db_path, events, since),
     }
 
     if args.json:

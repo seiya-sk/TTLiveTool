@@ -35,6 +35,15 @@ JST = timezone(timedelta(hours=9))
 ERROR_RULES = {
     "recording.failed": {"throttle_sec": 600,   "title": "録画失敗"},
     "proxy.degraded":   {"throttle_sec": 1800,  "title": "プロキシ異常"},
+    # 署名枯渇は **プロキシ異常とは別物**。2026-09-01 に2時間の全停止を
+    # 起こしたのはこれで、当時は proxy.degraded(タイトル「プロキシ異常」)
+    # として通知されていた。原因の切り分けを誤らせるので分離する --
+    # プロキシは正常で、Euler Stream の日次上限に当たっているだけ。対処も
+    # まったく違う(IPの交換ではなく、上限が戻るのを待つか枠を増やす)。
+    # throttle が短いのは、これが起きている間は録画が止まっているため。
+    "signature.exhausted": {"throttle_sec": 900, "title": "署名枯渇(録画停止)"},
+    # 原因を問わず「データが取れていない」ことそのものを通知する。
+    "data.blackout":    {"throttle_sec": 1800,  "title": "データ取得の停止"},
     "storage.warning":  {"throttle_sec": 86400, "title": "容量警告"},
     "cleanup.result":   {"throttle_sec": 86400, "title": "掃除結果(日次)"},
 }
@@ -142,6 +151,7 @@ def tail_new_lines(path: str, cursor: dict) -> tuple[list[str], dict]:
 def collect_from_events(lines: list[str]) -> dict:
     """録画イベントJSONLから、録画失敗とプロキシ異常の材料を抜き出す。"""
     failures, proxy_errors, benign_closures = [], [], []
+    signature_limits = []
     for line in lines:
         line = line.strip()
         if not line:
@@ -177,15 +187,20 @@ def collect_from_events(lines: list[str]) -> dict:
                     "timestamp": d.get("timestamp"),
                 })
         elif event == "status" and d.get("kind") == "signature_rate_limit":
-            proxy_errors.append({
-                "error_class": "signature_rate_limit",
+            # **proxy_errors には入れない。** プロキシは正常で、署名サービス
+            # (Euler Stream)の上限に当たっているだけ。混ぜると「プロキシ異常」
+            # として届き、IPを疑う方向へ調査を誘導する。
+            info = d.get("info") or {}
+            signature_limits.append({
                 "username": d.get("username"),
                 "proxy": d.get("proxy"),
                 "timestamp": d.get("timestamp"),
+                "wait_sec": info.get("wait_seconds"),
             })
     return {
         "recording_failures": failures,
         "proxy_errors": proxy_errors,
+        "signature_limits": signature_limits,
         "benign_closures": benign_closures,
     }
 
@@ -271,6 +286,99 @@ def build_proxy_message(errors: list[dict], suppressed: int) -> str:
     return chatwork.format_info(f"[プロキシ異常] {len(errors)}件", "\n".join(lines))
 
 
+def build_signature_message(limits: list[dict], suppressed: int) -> str:
+    """署名枯渇の通知。**プロキシ異常とは別の文面にする。**
+
+    2026-09-01 の実害(22〜24時のイベント0件)を踏まえ、「録画が止まっている」
+    ことを一行目に置く。何が起きているかが冒頭に無いと、深夜に届いた通知が
+    朝まで放置される。
+    """
+    waits = [l["wait_sec"] for l in limits if l.get("wait_sec")]
+    by_proxy: dict = {}
+    for l in limits:
+        by_proxy[l["proxy"]] = by_proxy.get(l["proxy"], 0) + 1
+    lines = [
+        "Euler Stream の署名上限に達しました。この間、新しい録画は開始できません。",
+        "",
+        f"発生: {len(limits)}件",
+        "影響IP: " + (", ".join(f"{k}×{v}" for k, v in
+                              sorted(by_proxy.items(), key=lambda x: -x[1])[:10]) or "-"),
+    ]
+    if waits:
+        lines.append(f"最長の待ち時間: 約{max(waits) / 3600:.1f}時間")
+    lines += [
+        "",
+        "※ プロキシの異常ではありません。IPを替えても解決しません。",
+        "※ 上限は 100/IP/日(匿名)。枠を増やすには Euler Stream の APIキー設定が要ります。",
+    ]
+    if suppressed:
+        lines.append(f"(抑止期間中に追加で {suppressed} 件)")
+    return chatwork.format_info(
+        f"[署名枯渇] 録画が停止しています({len(limits)}件)", "\n".join(lines))
+
+
+def check_blackout(db_path: str, events_path: str) -> dict | None:
+    """「取れるはずのデータが取れていない」かを、原因を問わず判定する。
+
+    判定そのものは health_report と同じ関数を使う -- 二重に実装すると、
+    片方だけ直したときに健診と通知で食い違う。直近1時間だけを見る
+    (通知は「いま起きているか」だけが要る)。
+    """
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    try:
+        import health_report as hr
+    except Exception:
+        logger.debug("health_report を読み込めないので欠測判定をスキップ", exc_info=True)
+        return None
+    since = datetime.now(hr.JST) - timedelta(hours=1)
+    try:
+        events = hr.load_events(events_path, since)
+        import io, contextlib
+        with contextlib.redirect_stdout(io.StringIO()):     # 健診の画面出力は要らない
+            result = hr.report_blackouts(db_path, events, since)
+    except Exception:
+        logger.warning("欠測判定に失敗(通知はスキップ)", exc_info=True)
+        return None
+    if not result.get("windows"):
+        return None
+    last = result["windows"][-1]
+    # いま継続中のものだけ通知する。終わった障害を蒸し返さない。
+    end = datetime.fromisoformat(last["end"])
+    if (datetime.now(hr.JST) - end).total_seconds() > hr.BLACKOUT_WINDOW_MIN * 60 * 2:
+        return None
+    return {
+        "window_min": hr.BLACKOUT_WINDOW_MIN,
+        "ratio_pct": int(hr.BLACKOUT_RATIO * 100),
+        "baseline": result["baseline"],
+        "recent": last["min_events"],
+        "recording": last["recording"],
+        "live_seen": last["live_seen"],
+        "minutes": last["minutes"],
+    }
+
+
+def build_blackout_message(info: dict) -> str:
+    """原因を問わず「データが取れていない」ことを通知する。
+
+    署名枯渇(A-1)も上流ネットワーク断(A-3)も原因は違うが症状は同じ。
+    原因ごとの検知は必ず漏れるので、結果側にも1本置く。
+    """
+    lines = [
+        f"直近{info['window_min']}分のイベント取得が、平常の{info['ratio_pct']}%を下回っています。",
+        "",
+        f"平常時: {info['baseline']:.0f}件 / {info['window_min']}分",
+        f"直近  : {info['recent']}件",
+        f"継続  : {info['minutes']}分",
+        f"録画中セッション: {info['recording']}本",
+        f"巡回で配信中と判定: {info['live_seen']}回",
+        "",
+        "※ 原因は問いません(署名枯渇 / 上流障害 / プロセス停止のいずれでも上がります)。",
+        "※ 詳細は ops/health_report.py の「5. データ取得の欠測」を確認してください。",
+    ]
+    return chatwork.format_info(
+        "[データ取得の停止] 取れるはずのデータが取れていません", "\n".join(lines))
+
+
 def build_storage_message(info: dict) -> str:
     body = (
         f"ディスク使用率が {info['disk_pct']}% に達しました。\n"
@@ -352,6 +460,19 @@ def main() -> int:
             outbox.append(("proxy.degraded", build_proxy_message(proxy_errors, pending)))
         else:
             add_suppressed(state, "proxy.degraded", len(proxy_errors))
+
+    signature_limits = collected["signature_limits"]
+    if signature_limits:
+        pending = state.get("suppressed", {}).get("signature.exhausted", 0)
+        if throttled(state, "signature.exhausted", now):
+            add_suppressed(state, "signature.exhausted", len(signature_limits))
+        else:
+            outbox.append(("signature.exhausted",
+                           build_signature_message(signature_limits, pending)))
+
+    blackout = check_blackout(args.db_path, args.events_path)
+    if blackout and not throttled(state, "data.blackout", now):
+        outbox.append(("data.blackout", build_blackout_message(blackout)))
 
     storage = check_storage(args.db_path)
     if storage and not throttled(state, "storage.warning", now):

@@ -9,7 +9,14 @@ if [ -r /etc/tts-notify.env ]; then
   SIGN_API_KEY=$(grep -E '^SIGN_API_KEY=' /etc/tts-notify.env | cut -d= -f2- | tr -d '"'"'"'" ')
   [ -n "$SIGN_API_KEY" ] && export SIGN_API_KEY
 fi
-# TTS_DISABLE_SCREENSHOTS は外した(2026-09-01)。Linux移行時の保険だったが、
+# 起動元シェルに TTS_DISABLE_SCREENSHOTS が残っていると、スクショが
+# 黙って無効になる。**「設定しない」だけでは足りず、明示的に消す必要がある**
+# -- 2026-09-02 の棚卸しで、01:37の再起動から約10時間、セッション13本が
+# 1枚も撮れていなかった。ログには1行も出ない(撮影を試みないので失敗も
+# しない)ため、DBのスクショ件数を数えるまで気づけなかった。
+unset TTS_DISABLE_SCREENSHOTS
+
+# 上記の変数を run_trial.sh 側で設定するのはやめた(2026-09-01)。Linux移行時の保険だったが、
 # playwright install --with-deps chromium を導入し、screenshot.py の
 # <video> 待ち時間バグ(6秒固定では VPS+プロキシ経由で間に合わなかった)を
 # 直したうえで実撮影を確認済み。撮影は配信開始10分後に1枚

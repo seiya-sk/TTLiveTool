@@ -518,6 +518,26 @@ def end_session(conn: sqlite3.Connection, live_session_id: int, end_detection_ty
     conn.commit()
 
 
+def get_session_started_at(conn: sqlite3.Connection, live_session_id: int) -> str | None:
+    row = conn.execute(
+        "SELECT started_at FROM live_sessions WHERE id = ?", (live_session_id,)
+    ).fetchone()
+    return row[0] if row else None
+
+
+def session_has_screenshot(conn: sqlite3.Connection, live_session_id: int) -> bool:
+    """このセッションのスクリーンショットが既に1枚でもあるか。
+
+    live_screenshots に一意制約が無いので、撮る側がここを見ないと同じ
+    セッションに複数枚入る。プロセスをまたいだ多重起動(再起動で再開した
+    ランナーが、前のプロセスが撮った1枚を知らずにもう1枚撮る)を防げるのは
+    この判定だけ -- メモリ上のフラグはプロセス境界を越えられない。
+    """
+    return conn.execute(
+        "SELECT 1 FROM live_screenshots WHERE live_session_id = ? LIMIT 1", (live_session_id,)
+    ).fetchone() is not None
+
+
 def insert_screenshot(
     conn: sqlite3.Connection,
     live_session_id: int,

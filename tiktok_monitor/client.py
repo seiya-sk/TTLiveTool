@@ -404,6 +404,13 @@ class SessionRunner:
                 )
                 self._recorded_opponents = set()
                 self._start_watchdog()
+                # **再開でもここを通す。** 以前は下の新規作成側にしか
+                # 置いておらず、再開したセッションは1枚も撮れなかった
+                # (2026-09-02 の棚卸しで判明: セッション78-90 の13本が
+                # すべて0枚)。この return は「live_sessions に行を作らない」
+                # ためだけのもので、スクショ/アバターを飛ばす理由は無かった。
+                # _start_watchdog() より後、という順序は新規作成側と揃える。
+                self._schedule_start_tasks()
                 return
 
             self.live_session_id = db.create_live_session(
@@ -414,35 +421,83 @@ class SessionRunner:
             )
             self._recorded_opponents = set()
             self._start_watchdog()
-            # One screenshot right at stream start (design doc section 3);
-            # fire-and-forget so a slow headless-browser capture never
-            # delays comment/gift event processing. Skippable via
-            # TTS_DISABLE_SCREENSHOTS (see config.py) -- e.g. a host without
-            # Playwright's Chromium installed.
-            if self.settings.screenshots_enabled:
-                self._screenshot_task = asyncio.get_event_loop().create_task(
-                    self._capture_screenshot_later(self.live_session_id)
-                )
-            # fetch_avatars' underlying TikTok endpoint only returns
-            # owner/avatar data while the room is resolvable -- confirmed
-            # empirically to come back empty for most streamers who aren't
-            # CURRENTLY live (see fetch_avatars.py's module docstring).
-            # Right here, mid-connect, the room is guaranteed resolvable, so
-            # this is the one reliable place to catch every streamer's
-            # avatar within their first tracked stream. The dashboard's
-            # "add streamer" flow also attempts a fetch immediately (best-
-            # effort, works if they streamed recently enough that TikTok
-            # still serves cached room data) -- this is the guaranteed
-            # fallback for everyone else.
+            self._schedule_start_tasks()
+
+    def _schedule_start_tasks(self) -> None:
+        """スクリーンショットとアバター取得を仕掛ける。**新規作成と再開の両方から呼ぶ。**
+
+        多重起動しないこと: 同じランナーで2度呼ばれても、一度仕掛けたら
+        作り直さない。プロセスをまたぐ多重(再起動後のランナーが、前の
+        プロセスの撮った1枚を知らずにもう1枚撮る)は、メモリ上のフラグでは
+        防げないので _capture_screenshot_later 側が live_screenshots を見て
+        防ぐ。二段構えなのはそのため。
+        """
+        # One screenshot per live (design doc section 3); fire-and-forget so
+        # a slow headless-browser capture never delays comment/gift event
+        # processing. Skippable via TTS_DISABLE_SCREENSHOTS (see config.py)
+        # -- e.g. a host without Playwright's Chromium installed.
+        if self.settings.screenshots_enabled and self._screenshot_task is None:
+            self._screenshot_task = asyncio.get_event_loop().create_task(
+                self._capture_screenshot_later(self.live_session_id)
+            )
+        # fetch_avatars' underlying TikTok endpoint only returns
+        # owner/avatar data while the room is resolvable -- confirmed
+        # empirically to come back empty for most streamers who aren't
+        # CURRENTLY live (see fetch_avatars.py's module docstring).
+        # Right here, mid-connect, the room is guaranteed resolvable, so
+        # this is the one reliable place to catch every streamer's
+        # avatar within their first tracked stream. The dashboard's
+        # "add streamer" flow also attempts a fetch immediately (best-
+        # effort, works if they streamed recently enough that TikTok
+        # still serves cached room data) -- this is the guaranteed
+        # fallback for everyone else.
+        if self._avatar_task is None:
             self._avatar_task = asyncio.get_event_loop().create_task(self._maybe_fetch_avatar())
 
-    async def _capture_screenshot_later(self, live_session_id: int) -> None:
-        """開始直後ではなく screenshot_delay_sec 後に1枚撮る。開始直後は
-        配信の準備画面や暗転が写りやすい。待っている間に配信が終われば
-        end_now() がこのタスクを cancel するので、短い配信は撮られない。"""
+    def _screenshot_wait_sec(self, live_session_id: int) -> float:
+        """あと何秒待てば「セッション開始から screenshot_delay_sec」になるか。
+
+        **タスクを仕掛けた時刻ではなく、セッション開始時刻から数える。**
+        再開のたびに仕掛け直すので、仕掛けた時刻を基準にすると再開のたびに
+        10分待ち直すことになる。10分より短い間隔で再起動や乗り換えが起きる
+        配信は、いつまでも1枚も撮れない。すでに過ぎていれば 0 を返す
+        (= 即座に撮る)。
+        """
+        delay = self.settings.screenshot_delay_sec
+        started_at = db.get_session_started_at(self.conn, live_session_id)
+        if not started_at:
+            return delay
         try:
-            await asyncio.sleep(self.settings.screenshot_delay_sec)
+            started = datetime.fromisoformat(started_at)
+        except ValueError:
+            # 想定外の書式。待たずに撮るより、従来どおり待つほうが安全
+            # (開始直後は準備画面や暗転が写る)。
+            return delay
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+        elapsed = (datetime.now(timezone.utc) - started).total_seconds()
+        return max(0.0, delay - elapsed)
+
+    async def _capture_screenshot_later(self, live_session_id: int) -> None:
+        """セッション開始から screenshot_delay_sec 経った時点で1枚撮る。
+
+        開始直後を避けるのは、配信の準備画面や暗転が写りやすいため。
+        待っている間に配信が終われば end_now() がこのタスクを cancel する
+        ので、短い配信は撮られない。
+        """
+        # 既に撮ってあるセッションなら、待つ意味も撮る意味もない
+        # (再起動で再開したときにここへ来る)。
+        if db.session_has_screenshot(self.conn, live_session_id):
+            return
+        try:
+            remaining = self._screenshot_wait_sec(live_session_id)
+            if remaining > 0:
+                await asyncio.sleep(remaining)
         except asyncio.CancelledError:
+            return
+        # 待っている間に別のランナー(乗り換え先や再起動後)が撮っている
+        # ことがある。live_screenshots に一意制約が無いので、直前にもう一度見る。
+        if db.session_has_screenshot(self.conn, live_session_id):
             return
         await self._capture_screenshot(live_session_id)
 

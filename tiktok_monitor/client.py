@@ -172,6 +172,34 @@ _KNOWN_LOSSY_PARSE_ERRORS = [
 
 GIFT_PARSE_FAILURE_LOG_PATH = "data/gift_parse_failures.jsonl"
 
+# DBに書けなかったイベントの退避先。**握りつぶさないための受け皿。**
+# 2026-09-02、掃除ジョブとの書き込み競合で24件のイベントが失われた。
+# 再試行(db.write_with_retry)を入れてもなお書けなかった場合、ここに
+# 全内容を残して後から復元できるようにする。件数が増えるようなら
+# 競合そのものを疑う指標にもなる。
+FAILED_EVENT_LOG_PATH = "data/failed_events.jsonl"
+
+
+def _record_failed_event(entry: dict) -> None:
+    """DBに書けなかったイベントを、失わないようにファイルへ落とす。
+
+    fsync まで行う(gift の取りこぼし退避と同じ作法)。ここまで来た時点で
+    DBは書けない状態なので、DBに書き直す選択肢は無い -- ファイルが唯一の
+    保存先になる。書式は live_events の列にそのまま対応させ、後から
+    一括で流し込めるようにしてある。
+    """
+    directory = os.path.dirname(FAILED_EVENT_LOG_PATH)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    try:
+        with open(FAILED_EVENT_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+    except Exception:
+        # ここで失敗したら本当に打つ手が無い。せめてログには残す。
+        logger.exception("failed-event の退避にも失敗した: %s", entry.get("event_type"))
+
 
 def _record_gift_parse_failure(payload: bytes | None, username: str | None = None) -> None:
     """Appends the full raw protobuf bytes (base64) for one failed
@@ -604,16 +632,36 @@ class SessionRunner:
         event_type, user_id, user_nickname, payload = normalizer(raw_event)
         raw_payload = event_normalizers.safe_serialize(raw_event)
         occurred_at = event_normalizers.extract_occurred_at(raw_event)
-        db.insert_event(
-            self.conn,
-            self.live_session_id,
-            event_type,
-            user_id,
-            user_nickname,
-            payload,
-            raw_payload,
-            occurred_at=occurred_at,
-        )
+        try:
+            db.insert_event(
+                self.conn,
+                self.live_session_id,
+                event_type,
+                user_id,
+                user_nickname,
+                payload,
+                raw_payload,
+                occurred_at=occurred_at,
+            )
+        except db.WriteFailed as exc:
+            # **捨てない。** 再試行しても書けなかったので、ファイルへ退避する。
+            logger.error(
+                "DBに書けなかったイベントを %s へ退避: type=%s @%s (%s)",
+                FAILED_EVENT_LOG_PATH, event_type, self.settings.username, exc,
+            )
+            _record_failed_event({
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "reason": str(exc),
+                "username": self.settings.username,
+                "live_session_id": self.live_session_id,
+                "event_type": event_type,
+                "user_id": user_id,
+                "user_nickname": user_nickname,
+                "payload": payload,
+                "raw_payload": raw_payload,
+                "occurred_at": occurred_at,
+            })
+            return
         logger.debug("event=%s user=%s payload=%s", event_type, user_nickname, payload)
 
     def _handle_battle_event(self, raw_event) -> None:

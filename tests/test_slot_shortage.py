@@ -290,3 +290,74 @@ def test_quarantine_also_works_while_full(tmp_path):
     asyncio.run(scenario())
 
     assert "gone" in trial._quarantined, "満杯中は隔離が進まない"
+
+
+def test_scanning_while_full_records_check_events(tmp_path):
+    """満杯中の巡回も check として記録すること。
+
+    記録しないとエラー率の分母だけが消え、混雑時間帯のIP品質が
+    過大評価される。実測(2026-09-02): 21時台 5.88% / 22時台 6.76% と
+    出たが、その時間帯の check は17件・74件しか記録されておらず
+    (平常は約700件)、実態は 0.51% だった。proxy.degraded の閾値判断
+    まで誤らせる。
+    """
+    trial = make_trial(10, status=w.LIVE, tmp_path=tmp_path)
+    trial.pool = ["someone_live"]
+    fill_recording_slots(trial)
+
+    asyncio.run(trial._scan_while_full())
+
+    checks = [e for e in read_events(trial) if e["event"] == "check"]
+    assert len(checks) == 1, "満杯中の巡回が check として記録されていない"
+    assert checks[0]["is_live"] is True
+    assert checks[0]["while_full"] is True, "満杯中であることが区別できない"
+    assert checks[0]["username"] == "someone_live"
+
+
+def test_offline_check_while_full_is_also_recorded(tmp_path):
+    """**分母が要点**なので、is_live=False も必ず記録すること。
+    枠不足(slot_shortage)は True のときしか出ないため、これが無いと
+    分母が欠ける。"""
+    trial = make_trial(10, status=w.OFFLINE, tmp_path=tmp_path)
+    trial.pool = ["someone_offline"]
+    fill_recording_slots(trial)
+
+    asyncio.run(trial._scan_while_full())
+
+    ev = read_events(trial)
+    assert [e for e in ev if e["event"] == "check"], "オフラインの巡回が記録されていない"
+    assert [e for e in ev if e["event"] == "slot_shortage"] == []
+
+
+def test_error_rate_denominator_is_not_lost_while_full(tmp_path):
+    """エラー率の分母が満杯中も残ること(分子だけ増えないこと)。"""
+    from TikTokLive.client.errors import UserOfflineError
+    import unittest.mock as m
+
+    trial = make_trial(10, status=w.OFFLINE, tmp_path=tmp_path)
+    trial.pool = ["a", "b", "c", "d"]
+    fill_recording_slots(trial)
+
+    calls = {"n": 0}
+
+    async def sometimes_fails(username, web_proxy=None, on_error=None):
+        calls["n"] += 1
+        if calls["n"] == 1 and on_error:
+            on_error(RuntimeError("ConnectTimeout('')"))
+            return w.UNKNOWN
+        return w.OFFLINE
+
+    async def scenario():
+        with m.patch.object(trial.pacer, "check_status", side_effect=sometimes_fails):
+            for _ in range(4):
+                await trial._scan_while_full()
+
+    asyncio.run(scenario())
+
+    ev = read_events(trial)
+    checks = [e for e in ev if e["event"] == "check"]
+    errors = [e for e in ev if e["event"] == "check_error"]
+    assert len(checks) == 4, f"分母が欠けている: check {len(checks)}件"
+    assert len(errors) == 1
+    rate = 100 * len(errors) / len(checks)
+    assert rate == 25.0, f"エラー率が実態とずれる: {rate}%"

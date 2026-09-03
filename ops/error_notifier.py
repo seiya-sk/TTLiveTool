@@ -96,8 +96,23 @@ def is_benign_disconnect(error_text: str) -> bool:
     return code is not None and code in BENIGN_WEBSOCKET_CLOSE_CODES
 
 
-# プロキシ異常とみなす check_error の下限件数(1回のタイムアウトは警報しない)
-PROXY_ERROR_MIN_COUNT = 3
+# --- プロキシ異常とみなす条件(2026-09-03 改定)-----------------------------
+# 以前は「check_error が3件以上」だけだった。数件の ReadTimeout で
+# 「プロキシ異常」が飛ぶのは過剰で、本当に見たい異常が埋もれる。
+# 実測のベースラインは 0.51%(時間別中央値)で、平常運転でも1分あたり
+# 数件のタイムアウトは出る。
+#
+# 次のいずれかに当てはまるときだけ通知する。3つは別々の壊れ方を捉える:
+#   広域   -- 5本以上のIPが同時に被弾 = 事業者側/上流の障害
+#   局所   -- 単一IPに10件以上集中     = そのIPの劣化
+#   全体率 -- エラー率が平常の10倍     = 個別IPでは説明できない全体的な悪化
+PROXY_DEGRADED_MIN_IPS = 5
+PROXY_DEGRADED_MIN_PER_IP = 10
+PROXY_BASELINE_ERROR_PCT = 0.51
+PROXY_DEGRADED_RATE_MULTIPLIER = 10
+# 率で判定するには分母が要る。通知は1分ごとに走るので、少ない試行回数で
+# 率を語ると 1/3 = 33% のような無意味な値で警報が飛ぶ。
+PROXY_DEGRADED_RATE_MIN_CHECKS = 50
 
 DISK_WARN_PCT = 80
 CLEANUP_DIGEST_JST_HOUR = 9  # 日次ダイジェストを送る時刻(JST)
@@ -152,6 +167,7 @@ def collect_from_events(lines: list[str]) -> dict:
     """録画イベントJSONLから、録画失敗とプロキシ異常の材料を抜き出す。"""
     failures, proxy_errors, benign_closures = [], [], []
     signature_limits = []
+    check_total = 0
     for line in lines:
         line = line.strip()
         if not line:
@@ -177,6 +193,10 @@ def collect_from_events(lines: list[str]) -> dict:
                 benign_closures.append(record)
             else:
                 failures.append(record)
+        elif event == "check":
+            # エラー率の **分母**。満杯中の巡回も check として記録されるので
+            # (proxy_pool_trial._scan_while_full)、混雑時間帯でも分母が欠けない。
+            check_total += 1
         elif event == "check_error":
             cls = str(d.get("error", "")).split("(")[0]
             if cls not in BENIGN_CHECK_ERRORS:
@@ -201,6 +221,7 @@ def collect_from_events(lines: list[str]) -> dict:
         "recording_failures": failures,
         "proxy_errors": proxy_errors,
         "signature_limits": signature_limits,
+        "check_total": check_total,
         "benign_closures": benign_closures,
     }
 
@@ -272,12 +293,46 @@ def build_recording_failure_message(failures: list[dict], suppressed: int) -> st
     return chatwork.format_info(f"[録画失敗] {len(failures)}件", "\n".join(lines))
 
 
-def build_proxy_message(errors: list[dict], suppressed: int) -> str:
+def proxy_degraded_reasons(errors: list[dict], check_total: int) -> list[str]:
+    """通知すべき理由を返す。空なら通知しない。
+
+    理由を文字列で返すのは、本文に「なぜ鳴ったか」を書くため。
+    「プロキシ異常3件」とだけ言われても、IPを替えるべきか上流の障害を
+    疑うべきかが判断できない。
+    """
+    reasons = []
+    by_proxy: dict = {}
+    for e in errors:
+        by_proxy[e.get("proxy")] = by_proxy.get(e.get("proxy"), 0) + 1
+
+    if len(by_proxy) >= PROXY_DEGRADED_MIN_IPS:
+        reasons.append(f"{len(by_proxy)}本のIPが同時に被弾(上流の障害を疑う)")
+
+    worst = max(by_proxy.items(), key=lambda kv: kv[1], default=(None, 0))
+    if worst[1] >= PROXY_DEGRADED_MIN_PER_IP:
+        reasons.append(f"単一IPに{worst[1]}件が集中: {worst[0]}(そのIPの劣化を疑う)")
+
+    if check_total >= PROXY_DEGRADED_RATE_MIN_CHECKS:
+        rate = 100 * len(errors) / check_total
+        threshold = PROXY_BASELINE_ERROR_PCT * PROXY_DEGRADED_RATE_MULTIPLIER
+        if rate >= threshold:
+            reasons.append(
+                f"エラー率 {rate:.1f}% が平常({PROXY_BASELINE_ERROR_PCT}%)の"
+                f"{PROXY_DEGRADED_RATE_MULTIPLIER}倍以上"
+            )
+    return reasons
+
+
+def build_proxy_message(errors: list[dict], suppressed: int, reasons: list[str] | None = None) -> str:
     by_class, by_proxy = {}, {}
     for e in errors:
         by_class[e["error_class"]] = by_class.get(e["error_class"], 0) + 1
         by_proxy[e["proxy"]] = by_proxy.get(e["proxy"], 0) + 1
     lines = [f"プロキシ経由のチェックで {len(errors)} 件のエラーが発生しました。", ""]
+    if reasons:
+        lines.append("通知した理由:")
+        lines += [f"  - {r}" for r in reasons]
+        lines.append("")
     lines.append("種別: " + ", ".join(f"{k}×{v}" for k, v in sorted(by_class.items(), key=lambda x: -x[1])))
     lines.append("IP別: " + ", ".join(f"{k}×{v}" for k, v in sorted(by_proxy.items(), key=lambda x: -x[1])[:10]))
     lines.append("\n※ UserNotFoundError(削除済みアカウント)は除外済み")
@@ -456,8 +511,10 @@ def main() -> int:
         pending = state.get("suppressed", {}).get("proxy.degraded", 0)
         if throttled(state, "proxy.degraded", now):
             add_suppressed(state, "proxy.degraded", len(proxy_errors))
-        elif len(proxy_errors) + pending >= PROXY_ERROR_MIN_COUNT:
-            outbox.append(("proxy.degraded", build_proxy_message(proxy_errors, pending)))
+        elif proxy_degraded_reasons(proxy_errors, collected.get("check_total", 0)):
+            outbox.append(("proxy.degraded", build_proxy_message(
+                proxy_errors, pending,
+                proxy_degraded_reasons(proxy_errors, collected.get("check_total", 0)))))
         else:
             add_suppressed(state, "proxy.degraded", len(proxy_errors))
 

@@ -21,6 +21,7 @@ Usage: python -m tiktok_monitor.cleanup_raw_payloads [--db-path PATH]
 """
 import argparse
 import logging
+import time
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
@@ -40,6 +41,60 @@ def get_retention_days(conn: sqlite3.Connection) -> int:
         return int(row["value"])
     except (TypeError, ValueError):
         return DEFAULT_RETENTION_DAYS
+
+
+# 1トランザクションで消す行数。**ロックの保持時間を短く保つのが目的。**
+# 以前は対象セッション全部を1文で消しており、最大19,070行(約430MB)を
+# 1トランザクションで処理して書き込みロックを最長47.7秒握っていた。
+# その間、録画側の INSERT が busy_timeout(5秒)を超えて失敗し、
+# 2026-09-02 の一晩でイベント24件が失われた。
+#
+# 1行あたり約23KBなので、500行で約11MB。実測でコミットまで1秒未満に収まる。
+DELETE_BATCH_ROWS = 500
+# バッチ間に挟む休止。SQLite のロック取得は先着順を保証しないので、
+# 間を空けずに次のバッチへ行くと掃除側が連続で取り続けうる。
+# 録画側に確実に順番が回るようにする。
+DELETE_BATCH_PAUSE_SEC = 0.05
+
+
+def delete_raw_payloads_batched(
+    conn: sqlite3.Connection,
+    session_ids: list[int],
+    batch_rows: int = DELETE_BATCH_ROWS,
+    pause_sec: float = DELETE_BATCH_PAUSE_SEC,
+) -> int:
+    """対象セッションの生ペイロードを小分けにして削除し、削除件数を返す。
+
+    毎バッチ commit する。ロックを短時間しか持たないので、録画側の書き込みが
+    待たされても busy_timeout の内側で収まる。
+
+    rowid で消すのが要点。「live_session_id が対象のもの」という条件で
+    LIMIT 付き DELETE を繰り返すと、live_events 側は消えないので同じ行が
+    何度も選ばれ、進まなくなる。消す対象そのものの rowid を取ってから
+    消せば、消えた分だけ確実に前に進む。
+    """
+    if not session_ids:
+        return 0
+    placeholders = ",".join("?" for _ in session_ids)
+    select_sql = f"""
+        SELECT p.rowid
+        FROM live_event_raw_payloads p
+        JOIN live_events e ON e.id = p.live_event_id
+        WHERE e.live_session_id IN ({placeholders})
+        LIMIT ?
+    """
+    deleted = 0
+    while True:
+        rowids = [r[0] for r in conn.execute(select_sql, (*session_ids, batch_rows))]
+        if not rowids:
+            break
+        marks = ",".join("?" for _ in rowids)
+        conn.execute(f"DELETE FROM live_event_raw_payloads WHERE rowid IN ({marks})", rowids)
+        conn.commit()
+        deleted += len(rowids)
+        if pause_sec:
+            time.sleep(pause_sec)
+    return deleted
 
 
 def find_eligible_session_ids(conn: sqlite3.Connection, retention_days: int) -> list[int]:
@@ -83,15 +138,7 @@ def cleanup_raw_payloads(
     row_count = _raw_payload_row_count(conn, session_ids)
 
     if not dry_run and session_ids:
-        placeholders = ",".join("?" for _ in session_ids)
-        conn.execute(
-            f"""
-            DELETE FROM live_event_raw_payloads
-            WHERE live_event_id IN (SELECT id FROM live_events WHERE live_session_id IN ({placeholders}))
-            """,
-            session_ids,
-        )
-        conn.commit()
+        delete_raw_payloads_batched(conn, session_ids)
 
     return {
         "retention_days": retention_days,
@@ -140,15 +187,7 @@ def cleanup_raw_payloads_for_session_ids(
     row_count = _raw_payload_row_count(conn, eligible_ids)
 
     if not dry_run and eligible_ids:
-        eligible_placeholders = ",".join("?" for _ in eligible_ids)
-        conn.execute(
-            f"""
-            DELETE FROM live_event_raw_payloads
-            WHERE live_event_id IN (SELECT id FROM live_events WHERE live_session_id IN ({eligible_placeholders}))
-            """,
-            eligible_ids,
-        )
-        conn.commit()
+        delete_raw_payloads_batched(conn, eligible_ids)
 
     return {"session_ids": eligible_ids, "sessions": len(eligible_ids), "rows": row_count, "skipped": skipped}
 

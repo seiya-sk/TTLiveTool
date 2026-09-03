@@ -156,8 +156,19 @@ SLOT_SHORTAGE_LOG_INTERVAL_SEC = 300.0   # 同一ライバーの連続見送り�
 #
 # 全体では connection_error 60件のうち13件(22%)がこの1人。ここを潰すと
 # 実測 1.25署名/ライブ が 1.05〜1.10 まで下がる。
-MAX_INITIAL_CONNECT_ATTEMPTS = 2        # 同一 (username, room_id) への接続試行の上限
-INITIAL_CONNECT_COOLDOWN_SEC = 1800.0   # 上限に達したら30分あけない
+MAX_INITIAL_CONNECT_ATTEMPTS = 2        # 1ラウンドあたりの接続試行の上限
+INITIAL_CONNECT_COOLDOWN_SEC = 1800.0   # 上限に達したら30分あける
+# クールダウンが明けたら試行回数を戻し、次のラウンドに入る。戻さないと
+# カウンタが際限なく増え、失敗のたびに冷却が再武装されて実質永久に
+# 接続できなくなる(2026-09-02 実測: user6059813828111 で attempts 3/2 に達し、
+# 119分の配信のうち27分=23%しか録画できなかった)。
+#
+# ただし戻すだけだと、繋がらない相手に30分ごとに2署名を払い続ける。
+# ラウンドごとに冷却を倍にして、諦めすぎず・粘りすぎずの中間を取る。
+#   1回目 30分 → 2回目 60分 → 3回目以降 120分(上限)
+# 長時間配信は途中から復帰できる余地を残しつつ、1配信あたりの署名は
+# 頭打ちになる(4時間の配信で最大6署名)。
+INITIAL_CONNECT_MAX_COOLDOWN_SEC = 7200.0
 # 1回の dispatch の中で run_with_reconnect に許す初回接続失敗の回数。
 # 1にすることで「1 dispatch = 1試行 = 署名1つ」が成立し、上の上限が
 # そのまま「同一ライブに使う署名の上限」になる。
@@ -188,12 +199,27 @@ class InitialConnectGate:
     def __init__(self):
         self._state: dict[str, dict] = {}
 
+    @staticmethod
+    def _new_state(room_id: str | None) -> dict:
+        return {"room_id": room_id, "attempts": 0, "cooldown_until": 0.0,
+                "last_ip_index": None, "ip_specific": False, "rounds": 0}
+
     def blocked_until(self, username: str, now: float) -> float | None:
         """クールダウン中なら明ける時刻を返す。対象外なら None。"""
         st = self._state.get(username)
         if st is None or st["cooldown_until"] <= now:
             return None
         return st["cooldown_until"]
+
+    def _roll_over_if_cooled_down(self, st: dict, now: float) -> None:
+        """クールダウンが明けていたら試行回数を戻し、次のラウンドに入る。
+
+        **戻すのが要点。** 戻さないと attempts が上限を超えて増え続け、
+        失敗のたびに冷却が再武装されて復帰できなくなる。
+        """
+        if st["cooldown_until"] and st["cooldown_until"] <= now:
+            st["attempts"] = 0
+            st["cooldown_until"] = 0.0
 
     def avoid_ip_index(self, username: str) -> int | None:
         """次の試行で避けるべきIP番号(直前の失敗がIP固有の症状だった場合)。"""
@@ -208,16 +234,32 @@ class InitialConnectGate:
         if st is None or (room_id is not None and st["room_id"] is not None
                           and room_id != st["room_id"]):
             # 初回、または別のライブ(room_id が変わった)。数え直す。
-            st = {"room_id": room_id, "attempts": 0, "cooldown_until": 0.0,
-                  "last_ip_index": None, "ip_specific": False}
+            st = self._new_state(room_id)
             self._state[username] = st
+        else:
+            # 同じライブ。冷却が明けていれば次のラウンドとして数え直す。
+            self._roll_over_if_cooled_down(st, now)
         if room_id is not None:
             st["room_id"] = room_id
+
+        # 冷却中に呼ばれた場合は数えない。巡回は冷却中のライバーを返さないので
+        # 通常は起こらないが、ここで数えると attempts が上限を超えて増え、
+        # 冷却も再武装されて復帰できなくなる(2026-09-02 の不具合そのもの)。
+        # 呼び出し側の作りに依らず不変条件を守るための防御。
+        if st["cooldown_until"] > now:
+            st["last_ip_index"] = ip_index
+            st["ip_specific"] = any(k in error_type for k in _IP_SPECIFIC_CONNECT_ERRORS)
+            return st
+
         st["attempts"] += 1
         st["last_ip_index"] = ip_index
         st["ip_specific"] = any(k in error_type for k in _IP_SPECIFIC_CONNECT_ERRORS)
         if st["attempts"] >= MAX_INITIAL_CONNECT_ATTEMPTS:
-            st["cooldown_until"] = now + INITIAL_CONNECT_COOLDOWN_SEC
+            st["rounds"] += 1
+            # ラウンドごとに冷却を倍にする(上限あり)。繋がらない相手に
+            # 永久に同じ間隔で払い続けないため。
+            backoff = INITIAL_CONNECT_COOLDOWN_SEC * (2 ** (st["rounds"] - 1))
+            st["cooldown_until"] = now + min(backoff, INITIAL_CONNECT_MAX_COOLDOWN_SEC)
         return st
 
     def record_success(self, username: str) -> None:
@@ -471,15 +513,16 @@ class ProxyPoolTrial:
                     room_id=st["room_id"], attempts=st["attempts"],
                     max_attempts=MAX_INITIAL_CONNECT_ATTEMPTS,
                     error_type=info.get("error_type"),
+                    rounds=st["rounds"],
                     ip_specific=st["ip_specific"],
                     cooling_down=st["cooldown_until"] > time.monotonic(),
                 )
                 if st["cooldown_until"] > time.monotonic():
                     logger.warning(
-                        "@%s: %d failed initial connection(s) for room %s -- not retrying "
-                        "for %.0f min (each attempt costs a signature)",
-                        username, st["attempts"], st["room_id"],
-                        INITIAL_CONNECT_COOLDOWN_SEC / 60,
+                        "@%s: %d failed initial connection(s) for room %s (round %d) -- "
+                        "not retrying for %.0f min (each attempt costs a signature)",
+                        username, st["attempts"], st["room_id"], st["rounds"],
+                        (st["cooldown_until"] - time.monotonic()) / 60,
                     )
 
         return on_status
@@ -653,6 +696,21 @@ class ProxyPoolTrial:
             username, web_proxy=web_proxy,
             on_error=lambda exc: self._handle_check_error(
                 exc, check_slot.index, check_slot.proxy_url, username),
+        )
+        # **満杯中の巡回も check として記録する。**
+        # 記録しないと、エラー率(check_error / check)の分母だけが消えて
+        # 混雑時間帯のIP品質が過大評価される。2026-09-02 の実測では
+        # 21時台が 5.88%、22時台が 6.76% と出たが、その時間帯の check は
+        # 17件・74件しか記録されておらず(平常は約700件)、実態は 0.51% だった。
+        # proxy.degraded の閾値判断まで誤らせるので、必ず残す。
+        self._log(
+            "check",
+            ip_index=check_slot.index,
+            proxy=_masked(check_slot.proxy_url),
+            username=username,
+            is_live=(status == watch_module.LIVE),
+            status=status,
+            while_full=True,     # 満杯中の巡回であることを区別できるようにする
         )
         if status != watch_module.LIVE:
             return      # 配信していないなら枠不足の被害ではない

@@ -97,3 +97,60 @@ def test_blackout_check_returns_none_when_there_is_no_data(tmp_path):
     dbmod.init_schema(conn)
     conn.close()
     assert en.check_blackout(str(db), write_events(tmp_path, [])) is None
+
+
+# --- proxy.degraded の閾値(2026-09-03 改定)--------------------------------
+def _errs(n, proxy="1.1.1.1:8080"):
+    return [{"error_class": "ConnectTimeout", "username": f"u{i}",
+             "proxy": proxy, "timestamp": "2026-09-03T00:00:00+00:00"} for i in range(n)]
+
+
+def test_a_few_timeouts_no_longer_trigger_an_alert():
+    """数件の ReadTimeout で「プロキシ異常」が飛ぶのは過剰。
+    平常運転(0.51%)でも1分あたり数件は出る。"""
+    assert en.proxy_degraded_reasons(_errs(3), check_total=700) == []
+    assert en.proxy_degraded_reasons(_errs(9), check_total=700) == []
+
+
+def test_widespread_errors_trigger_an_alert():
+    """5本以上のIPが同時に被弾 = 上流の障害を疑う。"""
+    errs = [e for i in range(5) for e in _errs(1, proxy=f"10.0.0.{i}:8080")]
+    reasons = en.proxy_degraded_reasons(errs, check_total=700)
+    assert reasons and "5本" in reasons[0]
+
+
+def test_concentration_on_one_ip_triggers_an_alert():
+    """単一IPに10件集中 = そのIPの劣化。"""
+    reasons = en.proxy_degraded_reasons(_errs(10), check_total=700)
+    assert any("単一IP" in r for r in reasons)
+
+
+def test_high_error_rate_triggers_an_alert():
+    """平常の10倍(5.1%)以上。分母は満杯中の巡回も含む。"""
+    reasons = en.proxy_degraded_reasons(_errs(6), check_total=100)   # 6%
+    assert any("エラー率" in r for r in reasons)
+
+
+def test_rate_rule_needs_a_big_enough_sample():
+    """試行が少ないうちは率で判定しない。1/3=33% で警報が飛ぶのを防ぐ。"""
+    assert en.proxy_degraded_reasons(_errs(1), check_total=3) == []
+    assert en.proxy_degraded_reasons(_errs(2), check_total=10) == []
+
+
+def test_the_alert_says_why_it_fired():
+    """IPを替えるべきか上流を疑うべきかが本文から分かること。"""
+    errs = [e for i in range(6) for e in _errs(2, proxy=f"10.0.0.{i}:8080")]
+    reasons = en.proxy_degraded_reasons(errs, check_total=700)
+    body = en.build_proxy_message(errs, suppressed=0, reasons=reasons)
+    assert "通知した理由" in body
+    assert "上流の障害を疑う" in body
+
+
+def test_check_events_are_counted_as_the_denominator():
+    """満杯中の巡回(while_full)も分母に入ること。"""
+    import json as _json
+    lines = [_json.dumps({"timestamp": "2026-09-03T00:00:00+00:00", "event": "check",
+                          "username": "u", "is_live": False, "while_full": True})
+             for _ in range(80)]
+    collected = en.collect_from_events(lines)
+    assert collected["check_total"] == 80

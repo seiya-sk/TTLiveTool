@@ -1,5 +1,6 @@
 import json
 import os
+import time
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
@@ -175,6 +176,30 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# 書き込みロックの待ち時間。Python の sqlite3 は既定5秒だが、それでは
+# 足りなかった -- 掃除ジョブ(cleanup_raw_payloads)が数万行を1トランザクション
+# で消していた間、録画側の INSERT が "database is locked" で失敗し、
+# 2026-09-02 の一晩でイベント24件を失った(掃除の所要は最長47.7秒)。
+#
+# 掃除側はバッチ分割してロック保持を1秒未満に抑えたが、待ち時間そのものも
+# 広げておく。待つのは無害(その場で寝るだけ)で、失敗はデータ損失に直結する。
+BUSY_TIMEOUT_MS = 30_000
+
+# 書き込みが競合したときの再試行。busy_timeout を使い切ってなお失敗する
+# ケース(掃除が長引いた、他プロセスが長いトランザクションを持っている)に
+# 備える最後の一段。指数バックオフで待つ。
+WRITE_RETRIES = 4
+WRITE_RETRY_BASE_SEC = 0.25
+
+
+class WriteFailed(Exception):
+    """再試行しても書き込めなかった。**呼び出し側は必ずデータを退避すること。**
+
+    握りつぶして次のイベントへ進むと、そのイベントは完全に失われる。
+    この例外は「捨てた」ではなく「呼び出し側に預けた」ことを意味する。
+    """
+
+
 def connect(db_path: str) -> sqlite3.Connection:
     directory = os.path.dirname(db_path)
     if directory:
@@ -182,7 +207,39 @@ def connect(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
     return conn
+
+
+def _is_locked_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "database is locked" in message or "database table is locked" in message
+
+
+def write_with_retry(conn: sqlite3.Connection, operation, *,
+                     retries: int = WRITE_RETRIES,
+                     base_sec: float = WRITE_RETRY_BASE_SEC):
+    """ロック競合で失敗した書き込みを指数バックオフで再試行する。
+
+    ロック以外のエラー(制約違反など)は再試行しても直らないので即座に投げる。
+    再試行を使い切ったら WriteFailed を投げる -- 呼び出し側にデータを
+    退避させるためで、ここで None を返して黙って進むことはしない。
+    """
+    last: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            return operation()
+        except sqlite3.OperationalError as exc:
+            if not _is_locked_error(exc):
+                raise
+            last = exc
+            try:
+                conn.rollback()      # 途中まで進んだトランザクションを畳む
+            except Exception:
+                pass
+            if attempt < retries:
+                time.sleep(base_sec * (2 ** attempt))
+    raise WriteFailed(f"{retries + 1}回試しても書き込めませんでした: {last}") from last
 
 
 def _migrate_split_raw_payload(conn: sqlite3.Connection) -> None:
@@ -428,6 +485,27 @@ def insert_event(
     payload: dict,
     raw_payload: dict,
     occurred_at: str | None = None,
+) -> int:
+    # イベント本体と生ペイロードは1つの書き込み単位として再試行する。
+    # 片方だけ入って片方が落ちると、生ペイロードの無いイベント行が残る。
+    def _insert():
+        return _insert_event_once(
+            conn, live_session_id, event_type, user_id, user_nickname,
+            payload, raw_payload, occurred_at,
+        )
+
+    return write_with_retry(conn, _insert)
+
+
+def _insert_event_once(
+    conn: sqlite3.Connection,
+    live_session_id: int,
+    event_type: str,
+    user_id: str | None,
+    user_nickname: str | None,
+    payload: dict,
+    raw_payload: dict,
+    occurred_at: str | None,
 ) -> int:
     cursor = conn.execute(
         """

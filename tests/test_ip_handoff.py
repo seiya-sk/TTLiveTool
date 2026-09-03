@@ -12,6 +12,8 @@ import time
 from pathlib import Path
 from unittest.mock import AsyncMock
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from tiktok_monitor import db
@@ -758,3 +760,88 @@ def test_other_errors_do_not_quarantine(tmp_path):
     trial._not_found_counts["someone"] = 2
     trial._not_found_counts.pop("someone", None)   # 別種エラーでのリセット相当
     assert "someone" not in trial._quarantined
+
+
+# --- クールダウン明けのカウンタ復帰(2026-09-03) -----------------------------
+def test_attempts_never_exceed_the_cap():
+    """**不変条件**: attempts が上限を超えないこと。
+
+    2026-09-02 の実測で attempts 3/2 が発生した。クールダウンが明けても
+    カウンタが戻らず、失敗のたびに冷却が再武装されていたため。
+    user6059813828111 は119分の配信のうち27分(23%)しか録画できなかった。
+    """
+    gate = ppt.InitialConnectGate()
+    now = time.monotonic()
+    # (1) 本番の流れ: 巡回は冷却中のライバーを返さないので、明けてから呼ばれる
+    t = now
+    for i in range(12):
+        if gate.blocked_until("u", t) is not None:
+            t = gate.blocked_until("u", t) + 1
+        st = gate.record_failure("u", "ROOM_A", "InvalidStatusCode", 1, now=t)
+        assert st["attempts"] <= ppt.MAX_INITIAL_CONNECT_ATTEMPTS, \
+            f"{i+1}回目で attempts={st['attempts']} が上限を超えた"
+
+    # (2) 防御: 冷却中に呼ばれても上限を超えないこと(呼び出し側の作りに依らない)
+    gate2 = ppt.InitialConnectGate()
+    for i in range(12):
+        st = gate2.record_failure("v", "ROOM_A", "InvalidStatusCode", 1, now=now + i)
+        assert st["attempts"] <= ppt.MAX_INITIAL_CONNECT_ATTEMPTS, \
+            f"冷却中の呼び出し{i+1}回目で attempts={st['attempts']}"
+
+
+def test_cooldown_expiry_resets_the_attempt_count():
+    """冷却が明けたら試行回数が戻り、次のラウンドに入ること。"""
+    gate = ppt.InitialConnectGate()
+    now = time.monotonic()
+    gate.record_failure("u", "ROOM_A", "InvalidStatusCode", 1, now=now)
+    st = gate.record_failure("u", "ROOM_A", "InvalidStatusCode", 1, now=now)
+    assert st["attempts"] == 2 and st["rounds"] == 1
+    assert gate.blocked_until("u", now) is not None
+
+    after = now + ppt.INITIAL_CONNECT_COOLDOWN_SEC + 1
+    assert gate.blocked_until("u", after) is None, "冷却が明けていない"
+    st = gate.record_failure("u", "ROOM_A", "InvalidStatusCode", 1, now=after)
+    assert st["attempts"] == 1, f"冷却明けにカウンタが戻っていない: {st['attempts']}"
+    assert gate.blocked_until("u", after) is None, \
+        "1回目の失敗で再び冷却に入っている(長時間配信を諦めすぎ)"
+
+
+def test_cooldown_backs_off_each_round_but_is_capped():
+    """繰り返し失敗する相手には間隔を広げる。ただし無限には広げない。
+
+    戻すだけだと、繋がらない相手に30分ごとに2署名を払い続ける。
+    ラウンドごとに倍にして頭打ちさせる。
+    """
+    gate = ppt.InitialConnectGate()
+    t = time.monotonic()
+    waits = []
+    for _ in range(5):
+        for _ in range(ppt.MAX_INITIAL_CONNECT_ATTEMPTS):
+            st = gate.record_failure("u", "ROOM_A", "InvalidStatusCode", 1, now=t)
+        waits.append(st["cooldown_until"] - t)
+        t = st["cooldown_until"] + 1        # 冷却明けまで進める
+
+    assert waits[0] == pytest.approx(ppt.INITIAL_CONNECT_COOLDOWN_SEC)
+    assert waits[1] > waits[0], "2ラウンド目で間隔が広がっていない"
+    assert max(waits) <= ppt.INITIAL_CONNECT_MAX_COOLDOWN_SEC, "上限を超えて広がった"
+    assert waits[-1] == waits[-2], "上限で頭打ちになっていない"
+
+
+def test_a_new_live_still_starts_from_scratch_after_backoff():
+    """別のライブになれば、バックオフの履歴を持ち越さないこと。"""
+    gate = ppt.InitialConnectGate()
+    t = time.monotonic()
+    for _ in range(6):
+        gate.record_failure("u", "ROOM_A", "InvalidStatusCode", 1, now=t)
+    st = gate.record_failure("u", "ROOM_B", "InvalidStatusCode", 1, now=t)
+    assert st["attempts"] == 1 and st["rounds"] == 0, "別ライブに履歴を持ち越した"
+
+
+def test_success_clears_the_backoff():
+    gate = ppt.InitialConnectGate()
+    t = time.monotonic()
+    for _ in range(4):
+        gate.record_failure("u", "ROOM_A", "InvalidStatusCode", 1, now=t)
+    gate.record_success("u")
+    st = gate.record_failure("u", "ROOM_A", "InvalidStatusCode", 1, now=t)
+    assert st["attempts"] == 1 and st["rounds"] == 0

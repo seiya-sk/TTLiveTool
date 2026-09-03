@@ -624,27 +624,22 @@ class SessionRunner:
             except Exception:
                 pass
 
-    def _record_event(self, normalizer, raw_event) -> None:
-        self._ensure_session()
-        if self.live_session_id is None:
-            return  # 終了済み -- 遅延イベントは捨てる(_ensure_session 参照)
-        self.note_event()
-        event_type, user_id, user_nickname, payload = normalizer(raw_event)
-        raw_payload = event_normalizers.safe_serialize(raw_event)
-        occurred_at = event_normalizers.extract_occurred_at(raw_event)
+    def _insert_event_safely(self, event_type, user_id, user_nickname,
+                             payload, raw_payload, occurred_at) -> bool:
+        """イベントを1件書き込む。書けなければファイルへ退避する。
+
+        **イベントを書き込む経路はすべてここを通すこと。** 直に
+        db.insert_event を呼ぶと、WriteFailed がそのまま上がって
+        コールバックの中で握りつぶされ、そのイベントは失われる
+        (2026-09-02 に失った24件と同じ結末になる)。
+        """
         try:
             db.insert_event(
-                self.conn,
-                self.live_session_id,
-                event_type,
-                user_id,
-                user_nickname,
-                payload,
-                raw_payload,
-                occurred_at=occurred_at,
+                self.conn, self.live_session_id, event_type, user_id,
+                user_nickname, payload, raw_payload, occurred_at=occurred_at,
             )
+            return True
         except db.WriteFailed as exc:
-            # **捨てない。** 再試行しても書けなかったので、ファイルへ退避する。
             logger.error(
                 "DBに書けなかったイベントを %s へ退避: type=%s @%s (%s)",
                 FAILED_EVENT_LOG_PATH, event_type, self.settings.username, exc,
@@ -661,6 +656,18 @@ class SessionRunner:
                 "raw_payload": raw_payload,
                 "occurred_at": occurred_at,
             })
+            return False
+
+    def _record_event(self, normalizer, raw_event) -> None:
+        self._ensure_session()
+        if self.live_session_id is None:
+            return  # 終了済み -- 遅延イベントは捨てる(_ensure_session 参照)
+        self.note_event()
+        event_type, user_id, user_nickname, payload = normalizer(raw_event)
+        raw_payload = event_normalizers.safe_serialize(raw_event)
+        occurred_at = event_normalizers.extract_occurred_at(raw_event)
+        if not self._insert_event_safely(event_type, user_id, user_nickname,
+                                         payload, raw_payload, occurred_at):
             return
         logger.debug("event=%s user=%s payload=%s", event_type, user_nickname, payload)
 
@@ -679,16 +686,12 @@ class SessionRunner:
             if opponent_id in self._recorded_opponents:
                 continue
             self._recorded_opponents.add(opponent_id)
-            db.insert_event(
-                self.conn,
-                self.live_session_id,
-                "battle_opponent",
-                opponent_id,
-                None,
+            if not self._insert_event_safely(
+                "battle_opponent", opponent_id, None,
                 {"opponent_id": opponent_id, "source_event_type": source_event_type},
-                raw_payload,
-                occurred_at=occurred_at,
-            )
+                raw_payload, occurred_at,
+            ):
+                continue
             logger.info("battle opponent detected: %s (via %s)", opponent_id, source_event_type)
 
     def _handle_envelope_event(self, raw_event) -> None:
@@ -710,16 +713,9 @@ class SessionRunner:
             return
         raw_payload = event_normalizers.safe_serialize(raw_event)
         occurred_at = event_normalizers.extract_occurred_at(raw_event)
-        db.insert_event(
-            self.conn,
-            self.live_session_id,
-            event_type,
-            user_id,
-            user_nickname,
-            payload,
-            raw_payload,
-            occurred_at=occurred_at,
-        )
+        if not self._insert_event_safely(event_type, user_id, user_nickname,
+                                         payload, raw_payload, occurred_at):
+            return
         logger.info("treasure box detected: coins=%s sender=%s", payload.get("coins"), user_nickname)
 
     def build_client(

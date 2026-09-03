@@ -263,3 +263,43 @@ def test_record_event_falls_back_instead_of_losing_the_event(tmp_path, monkeypat
     entries = [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines() if l.strip()]
     assert len(entries) == 1, "WriteFailed なのに退避されていない"
     assert entries[0]["event_type"] == "gift"
+
+
+def test_all_event_writes_go_through_the_safe_helper():
+    """イベントを書く経路が退避処理を必ず通ること。
+
+    直に db.insert_event を呼ぶ経路が増えると、そこだけ WriteFailed が
+    握りつぶされてイベントが失われる(2026-09-02 に失った24件と同じ結末)。
+    ヘルパ以外からの直接呼び出しが増えていないことを固定する。
+    """
+    source = (Path(__file__).resolve().parents[1] / "tiktok_monitor" / "client.py").read_text(
+        encoding="utf-8")
+    direct = [ln.strip() for ln in source.splitlines() if "db.insert_event(" in ln]
+    assert len(direct) == 1, (
+        f"db.insert_event の直接呼び出しが {len(direct)} 箇所ある。"
+        f"_insert_event_safely 経由にすること: {direct}"
+    )
+
+
+def test_battle_and_treasure_box_also_fall_back(tmp_path, monkeypatch):
+    """ギフト以外の経路(バトル・宝箱)でも退避されること。"""
+    path = tmp_path / "failed.jsonl"
+    monkeypatch.setattr(client_module, "FAILED_EVENT_LOG_PATH", str(path))
+    from tiktok_monitor.config import Settings
+
+    conn = db.connect(":memory:")
+    db.init_schema(conn)
+    settings = Settings(username="someone", db_path=":memory:", idle_timeout_sec=60,
+                        screenshots_enabled=False)
+    runner = client_module.SessionRunner(conn, settings)
+    runner.streamer_id = db.get_or_create_streamer(conn, "someone")
+    runner.live_session_id = db.create_live_session(conn, runner.streamer_id)
+
+    monkeypatch.setattr(db, "insert_event",
+                        lambda *a, **kw: (_ for _ in ()).throw(db.WriteFailed("locked")))
+
+    ok = runner._insert_event_safely("battle_opponent", "op1", None,
+                                     {"opponent_id": "op1"}, {"raw": 1}, None)
+    assert ok is False
+    entries = [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines() if l.strip()]
+    assert entries[0]["event_type"] == "battle_opponent"

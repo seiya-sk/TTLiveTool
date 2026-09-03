@@ -4,6 +4,7 @@ import { DocumentIcon, ImageIcon, PeopleIcon, PlusIcon } from "@/components/icon
 import { formatJst } from "@/lib/format";
 import type { ReportRow } from "@/lib/queries";
 import styles from "./AiReport.module.css";
+import { GenerateReportButton } from "./GenerateReportButton";
 
 const SECTION_DEFS: {
   key: "viewer_highlights" | "comment_trends" | "visual_feedback";
@@ -16,12 +17,30 @@ const SECTION_DEFS: {
   { key: "visual_feedback", title: "配信画面の見え方", icon: <ImageIcon size={16} />, accent: "purple" },
 ];
 
-export function AiReport({ report, sessionId }: { report: ReportRow | undefined; sessionId: number }) {
+export function AiReport({
+  report,
+  sessionId,
+  isLive = false,
+}: {
+  report: ReportRow | undefined;
+  sessionId: number;
+  /** 配信中はレポートを作らせない。途中経過で作ると内容が不完全なうえ、
+      「生成済み」になって作り直せなくなる。 */
+  isLive?: boolean;
+}) {
   if (!report) {
+    if (isLive) {
+      return (
+        <p className="empty">
+          配信中はレポートを生成できません。配信が終了すると生成できるようになります。
+        </p>
+      );
+    }
     return (
-      <p className="empty">
-        まだレポートは生成されていません。<code>python -m tiktok_monitor.generate_report {sessionId}</code> で生成できます。
-      </p>
+      <div>
+        <p className="empty">まだレポートは生成されていません。</p>
+        <GenerateReportButton sessionId={sessionId} />
+      </div>
     );
   }
 

@@ -58,6 +58,10 @@ export function NotificationGroups({
   const [editDraft, setEditDraft] = useState<Draft>(BLANK);
   const [pickerId, setPickerId] = useState<number | null>(null);
   const [picked, setPicked] = useState<number[]>([]);
+  // ライバー名の絞り込み。ピッカーは同時に1グループしか開かないので状態は1つでよいが、
+  // グループを切り替えたら必ず空に戻す(前のグループの絞り込みが残ると、
+  // 「表示中を全選択」が別グループの意図で押される)。
+  const [pickerSearch, setPickerSearch] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -130,12 +134,13 @@ export function NotificationGroups({
               <button className={styles.btn} disabled={busy}
                       onClick={() => {
                         setEditingId(editingId === g.id ? null : g.id);
-                        setEditDraft(toDraft(g)); setPickerId(null);
+                        setEditDraft(toDraft(g)); setPickerId(null); setPickerSearch("");
                       }}>
                 {editingId === g.id ? "閉じる" : "編集"}
               </button>
               <button className={styles.btn} disabled={busy}
                       onClick={() => {
+                        setPickerSearch("");
                         setPickerId(pickerId === g.id ? null : g.id);
                         setPicked(g.streamers.map((s) => s.id)); setEditingId(null);
                       }}>
@@ -204,8 +209,15 @@ export function NotificationGroups({
               <div style={{ fontSize: 13, color: "var(--muted)" }}>
                 このグループに含めるライバー(アーカイブ済みは表示されません)
               </div>
+              <PickerControls
+                assignable={assignable}
+                picked={picked}
+                setPicked={setPicked}
+                search={pickerSearch}
+                setSearch={setPickerSearch}
+              />
               <div className={styles.pickerGrid}>
-                {assignable.map((s) => (
+                {filterStreamers(assignable, pickerSearch).map((s) => (
                   <label key={s.id} className={styles.pickerItem}>
                     <input type="checkbox" checked={picked.includes(s.id)}
                            onChange={(e) =>
@@ -215,12 +227,18 @@ export function NotificationGroups({
                   </label>
                 ))}
               </div>
+              {filterStreamers(assignable, pickerSearch).length === 0 && (
+                <p className="empty" style={{ fontSize: 13 }}>
+                  「{pickerSearch}」に一致するライバーがいません。
+                </p>
+              )}
               <div className={styles.actions} style={{ marginTop: 14 }}>
                 <button className={`${styles.btn} ${styles.btnPrimary}`} disabled={busy}
                         onClick={async () => {
                           await call(`/api/notifications/groups/${g.id}/streamers`,
                             { method: "PUT", body: JSON.stringify({ streamerIds: picked }) });
                           setPickerId(null);
+                          setPickerSearch("");
                         }}>
                   割り当てを保存
                 </button>
@@ -248,6 +266,75 @@ export function NotificationGroups({
     </div>
   );
 }
+
+/** ライバー名での絞り込み。大文字小文字を無視し、部分一致で1文字ずつ効かせる。 */
+export function filterStreamers<T extends { name: string }>(list: T[], search: string): T[] {
+  const needle = search.trim().toLowerCase();
+  if (!needle) return list;
+  return list.filter((s) => s.name.toLowerCase().includes(needle));
+}
+
+/**
+ * 一括操作。日常の小さな変更をUI上で完結させるためのもので、
+ * CSVインポート/エクスポートとは用途が別。
+ *
+ * 「全部」と「表示中」を別のボタンに分けているのが要点。絞り込んでいる最中に
+ * 「全選択」を押したら、画面に出ていない人まで選ばれる -- それが欲しい場面も
+ * あるが、事故にもなる。絞り込み中だけ「表示中を…」を出し、どちらを操作して
+ * いるかをラベルで明示する。
+ */
+function PickerControls({
+  assignable, picked, setPicked, search, setSearch,
+}: {
+  assignable: GroupStreamer[];
+  picked: number[];
+  setPicked: (fn: (prev: number[]) => number[]) => void;
+  search: string;
+  setSearch: (v: string) => void;
+}) {
+  const shown = filterStreamers(assignable, search);
+  const filtering = search.trim().length > 0;
+  const shownIds = shown.map((s) => s.id);
+  const shownSelected = shownIds.filter((id) => picked.includes(id)).length;
+
+  return (
+    <div className={styles.pickerControls}>
+      <input
+        type="search"
+        className={styles.pickerSearch}
+        placeholder="ライバー名で絞り込み"
+        value={search}
+        onChange={(e) => setSearch(e.target.value)}
+        aria-label="ライバー名で絞り込み"
+      />
+      <button type="button" className={styles.btn}
+              onClick={() => setPicked(() => assignable.map((s) => s.id))}>
+        全選択（{assignable.length}人）
+      </button>
+      <button type="button" className={styles.btn}
+              onClick={() => setPicked(() => [])}>
+        全解除
+      </button>
+      {filtering && (
+        <>
+          <button type="button" className={styles.btn} disabled={shown.length === 0}
+                  onClick={() => setPicked((prev) => [...new Set([...prev, ...shownIds])])}>
+            表示中を全選択（{shown.length}人）
+          </button>
+          <button type="button" className={styles.btn} disabled={shown.length === 0}
+                  onClick={() => setPicked((prev) => prev.filter((id) => !shownIds.includes(id)))}>
+            表示中を全解除
+          </button>
+        </>
+      )}
+      <span className={styles.pickerCount}>
+        選択 {picked.length} / {assignable.length}人
+        {filtering && `（表示中 ${shownSelected} / ${shown.length}人）`}
+      </span>
+    </div>
+  );
+}
+
 
 function DraftForm({ draft, onChange }: { draft: Draft; onChange: (d: Draft) => void }) {
   const set = (patch: Partial<Draft>) => onChange({ ...draft, ...patch });

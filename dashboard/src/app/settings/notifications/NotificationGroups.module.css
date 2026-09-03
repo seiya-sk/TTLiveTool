@@ -51,3 +51,37 @@
 
 .unassigned { border-color: var(--warning); }
 .unassignedHead { color: var(--warning); font-weight: 700; font-size: 15px; }
+
+/* --- ピッカーの一括操作 --------------------------------------------------
+   絞り込みと一括操作を1行にまとめる。チェックボックスの並びより上に置き、
+   狭い画面では折り返す。 */
+.pickerControls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.pickerSearch {
+  flex: 1 1 200px;
+  min-width: 160px;
+  padding: 6px 10px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--foreground);
+  font-size: 13px;
+}
+
+.pickerSearch:focus {
+  outline: none;
+  border-color: var(--cyan);
+}
+
+.pickerCount {
+  font-size: 12px;
+  color: var(--muted);
+  margin-left: auto;
+  white-space: nowrap;
+}

@@ -101,7 +101,7 @@ export default async function SessionDetailPage(props: PageProps<"/sessions/[id]
       key: "ai-report",
       label: "AI分析",
       accent: "purple",
-      content: <AiReport report={report} sessionId={session.id} />,
+      content: <AiReport report={report} sessionId={session.id} isLive={session.status === "live"} />,
     },
     {
       key: "detail",

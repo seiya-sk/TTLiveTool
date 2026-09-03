@@ -68,6 +68,12 @@ DELETE_BATCH_START_ROWS = 10
 # 間を空けずに次のバッチへ行くと掃除側が連続で取り続けうる。
 # 録画側に確実に順番が回るようにする。
 DELETE_BATCH_PAUSE_SEC = 0.02
+# 1行あたり所要の「最悪値」をどれだけ速く忘れるか。1バッチごとにこの割合を
+# 掛ける。速くなったら行数も戻るが、戻り方は緩やか(10バッチで約35%)。
+PER_ROW_DECAY = 0.9
+# 1バッチで行数を増やせる上限倍率。急に倍以上へ伸ばすと、その1回で目標を
+# 大きく超える。
+DELETE_BATCH_GROWTH = 1.5
 
 
 def delete_raw_payloads_batched(
@@ -104,6 +110,8 @@ def delete_raw_payloads_batched(
     # 収束する前に終わる(2026-09-03 実測: 62セッションで229バッチ =
     # 1セッションあたり3.7バッチしかなく、ロック最大が1,755msに達した)。
     rows = batch_rows or start_rows or DELETE_BATCH_START_ROWS
+    # 最近見た中で最も遅かった1行あたりの所要(ms)。0 は「まだ観測なし」。
+    worst_per_row = 0.0
     deleted = 0
     worst_ms = 0.0
     batches = 0
@@ -127,10 +135,21 @@ def delete_raw_payloads_batched(
         size_history.append(len(rowids))
 
         if batch_rows is None and held_ms > 0:
-            # 実測から1行あたりの所要を出し、目標時間に収まる行数へ寄せる。
+            # 1行あたりの所要から次の行数を決める。**直前の1バッチではなく、
+            # 最近見た中で最も遅かった値を使う。**
+            #
+            # 直前だけを見ると、空いている瞬間に測った速い値で大きめの行数を
+            # 決めてしまい、その次が録画と競合すると目標を超える。実測
+            # (2026-09-03 15:02)では行数が 43〜126 の間で揺れ、最大250msに
+            # なった。遅い側に寄せておけば、揺れても超過しない。
+            # ゆっくり忘れる(0.9倍ずつ)ので、実際に速くなれば行数も戻る。
             per_row = held_ms / len(rowids)
+            worst_per_row = max(per_row, worst_per_row * PER_ROW_DECAY)
+            target_rows = target_ms / worst_per_row
+            # 増やすときは一気に伸ばさない。急に倍以上にすると、その1回で
+            # 目標を大きく超える。
             rows = int(max(DELETE_BATCH_MIN_ROWS,
-                           min(DELETE_BATCH_MAX_ROWS, target_ms / per_row)))
+                           min(DELETE_BATCH_MAX_ROWS, target_rows, rows * DELETE_BATCH_GROWTH)))
         if pause_sec:
             time.sleep(pause_sec)
 

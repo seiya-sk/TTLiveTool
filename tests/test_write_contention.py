@@ -403,3 +403,28 @@ def test_minimum_batch_is_small_enough_for_a_slow_environment():
     25行だと875msになっていた。"""
     assert cleanup.DELETE_BATCH_MIN_ROWS <= 10
     assert cleanup.DELETE_BATCH_START_ROWS <= 10
+
+
+def test_batch_size_is_based_on_the_worst_recent_rate(tmp_path):
+    """**直前の1バッチではなく、最近見た中で最も遅い値で行数を決めること。**
+
+    直前だけを見ると、空いている瞬間に測った速い値で大きめの行数を決めて
+    しまい、その次が録画と競合すると目標を超える。本番実測(2026-09-03 15:02)
+    では行数が 43〜126 の間で揺れ、ロック最大が250msになった。
+    """
+    conn, sids = make_db(tmp_path / "worst.db", sessions=1, events_per_session=300,
+                         payload_bytes=2000)
+    stats: dict = {}
+    cleanup.delete_raw_payloads_batched(conn, sids, pause_sec=0, stats=stats)
+    sizes = [s for s in stats["batch_sizes"] if isinstance(s, int)]
+    # 遅い側に寄せるので、行数は単調に暴れず、増加は抑制される
+    for a, b in zip(sizes, sizes[1:]):
+        assert b <= max(a * cleanup.DELETE_BATCH_GROWTH + 1, cleanup.DELETE_BATCH_MIN_ROWS), (
+            f"1バッチで {a} -> {b} と急増している(上限 {cleanup.DELETE_BATCH_GROWTH}倍)"
+        )
+
+
+def test_growth_is_damped():
+    """急に倍以上へ伸ばさない。その1回で目標を大きく超えるため。"""
+    assert cleanup.DELETE_BATCH_GROWTH <= 2.0
+    assert 0 < cleanup.PER_ROW_DECAY < 1.0, "最悪値を忘れないと、速くなっても行数が戻らない"

@@ -85,3 +85,51 @@
   margin-left: auto;
   white-space: nowrap;
 }
+
+/* --- CSV での一括編集 ----------------------------------------------------
+   適用前に差分を必ず見せる。件数だけだと、思っていたのと違う変更が混ざって
+   いても気づけない。追加と削除を左右に並べて対比させる。 */
+.csvLead { font-size: 13px; color: var(--muted); margin: 6px 0 12px; }
+.csvFile { font-size: 12px; color: var(--muted); margin-top: 8px; }
+.csvDone { font-size: 13px; color: var(--success); margin-top: 10px; }
+
+.csvErrors {
+  margin-top: 12px;
+  padding: 10px 14px;
+  border: 1px solid var(--danger);
+  border-radius: 6px;
+  font-size: 13px;
+  color: var(--danger);
+}
+.csvErrors ul { margin: 6px 0 0; padding-left: 18px; }
+.csvErrors li { margin: 2px 0; }
+
+.csvPreview { margin-top: 14px; border-top: 1px solid var(--border); padding-top: 12px; }
+.csvWarning { font-size: 13px; color: var(--warning); margin: 4px 0; }
+.csvSummary { font-size: 13px; margin: 8px 0 12px; }
+
+.csvDiffGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 16px;
+}
+
+.csvAddHead { font-size: 13px; font-weight: 700; color: var(--success); margin-bottom: 6px; }
+.csvRemoveHead { font-size: 13px; font-weight: 700; color: var(--danger); margin-bottom: 6px; }
+
+.csvDiffList {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 260px;
+  overflow-y: auto;
+  font-size: 13px;
+}
+.csvDiffList li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+  border-bottom: 1px solid var(--border);
+}
+.csvAccount { color: var(--muted); font-size: 12px; margin-left: auto; }

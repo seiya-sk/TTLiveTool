@@ -4,6 +4,7 @@ import { useState } from "react";
 import { formatJst } from "@/lib/format";
 import type { GroupStreamer, NotificationGroup } from "@/lib/notifications";
 import styles from "./NotificationGroups.module.css";
+import { CsvTransfer } from "./CsvTransfer";
 
 type Draft = {
   name: string; roomId: string; to: string;
@@ -247,6 +248,9 @@ export function NotificationGroups({
           )}
         </div>
       ))}
+
+      {/* CSV は大規模な入れ替え向け。日常の変更は上のピッカーの一括操作で足りる。 */}
+      <CsvTransfer onApplied={() => call("/api/notifications/groups", { method: "GET" })} />
 
       <div className={`${styles.card} ${unassigned.length ? styles.unassigned : ""}`}>
         <div className={styles.unassignedHead} style={unassigned.length ? undefined : { color: "var(--muted)" }}>

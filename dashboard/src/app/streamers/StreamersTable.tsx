@@ -6,6 +6,7 @@ import { DataTable, type Column } from "@/components/DataTable";
 import { RankBadge } from "@/components/RankBadge";
 import { StatusBadge } from "@/components/StatusBadge";
 import { avatarUrl, formatJst, formatNumber } from "@/lib/format";
+import { MIN_MINUTES_FOR_RATE } from "@/lib/metrics";
 import type { StreamerRow } from "@/lib/queries";
 
 const columns: Column<StreamerRow>[] = [
@@ -66,6 +67,28 @@ const columns: Column<StreamerRow>[] = [
     align: "right",
     render: (r) => formatNumber(r.sessionCount > 0 ? r.totalDiamonds / r.sessionCount : 0),
     width: "140px",
+  },
+  {
+    // 「誰に時間を割くか」を見るための列。累計ダイヤは長く配信した人が
+    // 有利になるが、これは配信時間で正規化してあるので実力の比較に使える。
+    key: "diamondsPerHour",
+    label: "ダイヤ/配信1時間",
+    accessor: (r) => r.diamondsPerHour,
+    align: "right",
+    render: (r) =>
+      r.diamondsPerHour === null ? (
+        // 短い配信では1回のギフトが率を支配する。値を出すと誤解を招くので
+        // 出さない(理由は hover で読めるようにする)。
+        <span
+          className="rate-unavailable"
+          title={`配信時間が${MIN_MINUTES_FOR_RATE}分未満のため算出していません（累計 ${Math.round(r.totalMinutes)}分）`}
+        >
+          -
+        </span>
+      ) : (
+        <>{formatNumber(r.diamondsPerHour)} 💎</>
+      ),
+    width: "150px",
   },
   {
     key: "status",

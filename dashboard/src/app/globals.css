@@ -1185,3 +1185,22 @@ th {
   white-space: nowrap;
   border: 0;
 }
+
+/* 指標の出所を小さく添える。実測値か外部申告値かを画面上で区別するため。 */
+.metric-source {
+  margin-left: 6px;
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 400;
+  color: var(--muted);
+  vertical-align: middle;
+  white-space: nowrap;
+}
+
+/* 算出できない率の表示。理由は title 属性で読めるようにしてある。 */
+.rate-unavailable {
+  color: var(--muted);
+  cursor: help;
+}

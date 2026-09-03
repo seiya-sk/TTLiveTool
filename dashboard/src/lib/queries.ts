@@ -1,3 +1,4 @@
+import { diamondsPerHour } from "./metrics";
 import { getDb } from "./db";
 import { groupBattleEvents, type BattleGroup } from "./battles";
 
@@ -245,8 +246,19 @@ export type StreamerRow = {
   sessionCount: number;
   lastSessionAt: string | null;
   totalDiamonds: number;
+  /** 終了済みライブの合計時間(分)。ダイヤ/時の分母であり、下限判定にも使う。 */
+  totalMinutes: number;
+  /**
+   * ダイヤ / 配信1時間。**配信時間が下限に満たないライバーは null。**
+   * 短い配信では1回のギフトが率を支配する -- 実測(2026-09-03)では
+   * 11.1分で1本だけのライバーが 59,814💎/時 となり、中央値1,247の48倍で
+   * 首位に立った。時間あたりの実力を示す指標としては誤解を招くので、
+   * 算出せず「-」を出す(MIN_MINUTES_FOR_RATE)。
+   */
+  diamondsPerHour: number | null;
   avatarPath: string | null;
 };
+
 
 // Same dedup rule as DEDUPED_GIFTS_SUBQUERY, correlated against the outer
 // streamer id and joined across all of that streamer's sessions -- backs
@@ -272,6 +284,14 @@ const _DEDUPED_GIFTS_BY_STREAMER_SUBQUERY = `
 // sessions stay fully reachable by direct link/URL; only the roster entry
 // is hidden (design doc 7-1).
 export function getStreamerList(): StreamerRow[] {
+  return _rawStreamerList().map((r) => ({
+    ...r,
+    diamondsPerHour: diamondsPerHour(r.totalDiamonds, r.totalMinutes),
+  }));
+}
+
+
+function _rawStreamerList(): Omit<StreamerRow, "diamondsPerHour">[] {
   const db = getDb();
   return db
     .prepare(
@@ -282,12 +302,14 @@ export function getStreamerList(): StreamerRow[] {
         (SELECT COUNT(*) FROM live_sessions WHERE streamer_id = s.id) as sessionCount,
         (SELECT MAX(started_at) FROM live_sessions WHERE streamer_id = s.id) as lastSessionAt,
         COALESCE((SELECT SUM(diamond_value) FROM (${_DEDUPED_GIFTS_BY_STREAMER_SUBQUERY})), 0) as totalDiamonds,
+        COALESCE((SELECT SUM((julianday(ended_at) - julianday(started_at)) * 1440)
+                  FROM live_sessions WHERE streamer_id = s.id AND ended_at IS NOT NULL), 0) as totalMinutes,
         s.avatar_path as avatarPath
       FROM streamers s
       WHERE s.archived = 0
       ORDER BY s.name`
     )
-    .all() as StreamerRow[];
+    .all() as Omit<StreamerRow, "diamondsPerHour">[];
 }
 
 // Unlike getStreamerList, intentionally not filtered by archived -- ライバー
@@ -668,21 +690,38 @@ function _diamondsForMonth(month: string): number {
   return row.total;
 }
 
-// Per-session average first, then averaged across sessions, so a
-// short-but-densely-sampled session doesn't outweigh a long one.
-function _avgConcurrentViewersForMonth(month: string): number | null {
+/**
+ * 月内のライブの「累計ユニーク視聴者」を合計する。
+ *
+ * 値の出どころ: TikTok が WebcastRoomUserSeqMessage の total_user として
+ * 送ってくる数字をそのまま記録している(events.py の normalize_viewer_count)。
+ * こちらの計算値・推定値ではない。生ペイロードでは total(同接)とは別の
+ * フィールドで届く。
+ *
+ * セッションごとに MAX を取るのは、この値が配信中ずっと単調増加するため
+ * (実測6,304遷移中、減少は1回だけで、それは 2,975 -> 0 という一瞬の
+ * ゼロ落ち。MAX ならこの外れ値を拾わない)。
+ *
+ * **注意: 録画開始前の視聴者も含む。** TikTok は配信開始からの通算で
+ * 数えており、こちらが途中から接続した場合もその分を含んだ値が届く。
+ * 実測では、接続前に既に9割以上カウントされていた配信が34本あった。
+ * そのため room_enter の実測ユニーク数より systematically 大きくなる
+ * (ほぼ最初から録れた配信でも中央値1.59倍、出遅れた配信では5.5倍)。
+ * ラベルで「TikTok申告」と明示しているのはこのため。
+ */
+function _uniqueViewersForMonth(month: string): number | null {
   const db = getDb();
   const row = db
     .prepare(
-      `SELECT AVG(session_avg) as avgViewers FROM (
-        SELECT AVG(CAST(json_extract(le.payload,'$.viewer_count') AS INTEGER)) as session_avg
+      `SELECT SUM(session_max) as uniqueViewers FROM (
+        SELECT MAX(CAST(json_extract(le.payload,'$.total_unique_viewers') AS INTEGER)) as session_max
         FROM live_events le
         WHERE le.event_type = 'viewer_count' AND strftime('%Y-%m', le.occurred_at, '+9 hours') = ?
         GROUP BY le.live_session_id
       )`
     )
-    .get(month) as { avgViewers: number | null };
-  return row.avgViewers === null ? null : Math.round(row.avgViewers);
+    .get(month) as { uniqueViewers: number | null };
+  return row.uniqueViewers === null ? null : Math.round(row.uniqueViewers);
 }
 
 function _totalCommentsForMonth(month: string): number {
@@ -756,8 +795,9 @@ export type MonthlyOverview = {
   sessionCount: number;
   totalDiamonds: number;
   diamondsChangePercent: number | null;
-  avgConcurrentViewers: number | null;
-  avgConcurrentChangePercent: number | null;
+  /** TikTok 申告の累計ユニーク視聴者(月内ライブの合計)。録画開始前の分も含む。 */
+  uniqueViewers: number | null;
+  uniqueViewersChangePercent: number | null;
   totalComments: number;
   totalCommentsChangePercent: number | null;
   topSession: TopSessionOfMonth | null;
@@ -773,8 +813,8 @@ export function getMonthlyOverview(month?: string): MonthlyOverview {
   const totalDiamonds = _diamondsForMonth(targetMonth);
   const previousDiamonds = _diamondsForMonth(previousMonth);
 
-  const avgConcurrentViewers = _avgConcurrentViewersForMonth(targetMonth);
-  const previousAvgConcurrent = _avgConcurrentViewersForMonth(previousMonth);
+  const uniqueViewers = _uniqueViewersForMonth(targetMonth);
+  const previousUniqueViewers = _uniqueViewersForMonth(previousMonth);
 
   const totalComments = _totalCommentsForMonth(targetMonth);
   const previousComments = _totalCommentsForMonth(previousMonth);
@@ -784,10 +824,10 @@ export function getMonthlyOverview(month?: string): MonthlyOverview {
     sessionCount: _sessionCountForMonth(targetMonth),
     totalDiamonds,
     diamondsChangePercent: _changePercent(totalDiamonds, previousDiamonds),
-    avgConcurrentViewers,
-    avgConcurrentChangePercent:
-      avgConcurrentViewers !== null && previousAvgConcurrent !== null
-        ? _changePercent(avgConcurrentViewers, previousAvgConcurrent)
+    uniqueViewers,
+    uniqueViewersChangePercent:
+      uniqueViewers !== null && previousUniqueViewers !== null
+        ? _changePercent(uniqueViewers, previousUniqueViewers)
         : null,
     totalComments,
     totalCommentsChangePercent: _changePercent(totalComments, previousComments),

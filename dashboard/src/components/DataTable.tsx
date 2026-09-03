@@ -128,7 +128,16 @@ export function DataTable<T>({
     const col = columns.find((c) => c.key === sort.key);
     if (!col) return filtered;
     const dir = sort.dir === "asc" ? 1 : -1;
-    return [...filtered].sort((a, b) => dir * compareValues(col.accessor(a), col.accessor(b)));
+    return [...filtered].sort((a, b) => {
+      const av = col.accessor(a);
+      const bv = col.accessor(b);
+      // 値が無い行(「-」)は昇順でも降順でも最後に置く。dir を掛けてしまうと
+      // 降順のときに先頭へ来て、1位のメダルが「値が無い行」に付く。
+      if (av === null && bv === null) return 0;
+      if (av === null) return 1;
+      if (bv === null) return -1;
+      return dir * compareValues(av, bv);
+    });
   }, [filtered, sort, columns]);
 
   // A new search/filter/sort result invalidates how far the user had paged

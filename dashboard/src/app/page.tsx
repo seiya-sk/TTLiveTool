@@ -202,15 +202,24 @@ export default async function HomePage(props: PageProps<"/">) {
               <div className="home-highlight-stats">
                 <KpiCard
                   accent="cyan"
-                  label="平均同接"
-                  value={overview.avgConcurrentViewers !== null ? formatNumber(overview.avgConcurrentViewers) : "-"}
+                  label={
+                    <>
+                      累計視聴者
+                      {/* 実測の入室数ではなく TikTok が申告する通算値であることを
+                          画面上に残す。両者は systematically 食い違い(ほぼ最初から
+                          録れた配信でも中央値1.59倍)、どちらを見ているかが後から
+                          分からないと数字を説明できない。 */}
+                      <span className="metric-source">TikTok申告</span>
+                    </>
+                  }
+                  value={overview.uniqueViewers !== null ? formatNumber(overview.uniqueViewers) : "-"}
                   caption={
-                    overview.avgConcurrentChangePercent !== null ? (
+                    overview.uniqueViewersChangePercent !== null ? (
                       <>
                         先月比{" "}
-                        <span className={overview.avgConcurrentChangePercent >= 0 ? "trend-up-inline" : "trend-down-inline"}>
-                          {overview.avgConcurrentChangePercent >= 0 ? "↑" : "↓"}
-                          {formatSignedPercent(overview.avgConcurrentChangePercent)}
+                        <span className={overview.uniqueViewersChangePercent >= 0 ? "trend-up-inline" : "trend-down-inline"}>
+                          {overview.uniqueViewersChangePercent >= 0 ? "↑" : "↓"}
+                          {formatSignedPercent(overview.uniqueViewersChangePercent)}
                         </span>
                       </>
                     ) : null

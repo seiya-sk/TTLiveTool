@@ -1204,3 +1204,6 @@ th {
   color: var(--muted);
   cursor: help;
 }
+
+/* ライバー管理の操作ボタン。無効化とアーカイブを並べる。 */
+.streamer-actions { display: flex; gap: 6px; flex-wrap: wrap; }

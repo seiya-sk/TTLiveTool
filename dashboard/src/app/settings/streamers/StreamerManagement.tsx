@@ -5,6 +5,7 @@ import { useState } from "react";
 import { Avatar } from "@/components/Avatar";
 import { DataTable, type Column } from "@/components/DataTable";
 import { StatusBadge } from "@/components/StatusBadge";
+import Tabs, { type TabDef } from "@/components/Tabs";
 import { avatarUrl, formatJst } from "@/lib/format";
 import type { StreamerManagementRow } from "@/lib/streamers";
 
@@ -42,14 +43,11 @@ export function StreamerManagement({ initialRows }: { initialRows: StreamerManag
     }
   }
 
-  async function toggleArchived(row: StreamerManagementRow) {
+  async function patch(row: StreamerManagementRow, body: Record<string, boolean>) {
     setBusyId(row.id);
     setError(null);
     try {
-      const updated = await postJson<StreamerManagementRow[]>(`/api/streamers/${row.id}`, {
-        archived: !row.archived,
-      });
-      setRows(updated);
+      setRows(await postJson<StreamerManagementRow[]>(`/api/streamers/${row.id}`, body));
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -57,30 +55,39 @@ export function StreamerManagement({ initialRows }: { initialRows: StreamerManag
     }
   }
 
-  const columns: Column<StreamerManagementRow>[] = [
+  // 状態は3つ。archived が立っていれば enabled は意味を持たない(アーカイブが優先)。
+  const stateOf = (r: StreamerManagementRow) =>
+    r.archived ? "アーカイブ済み" : r.enabled ? "有効" : "無効";
+
+  const nameColumn: Column<StreamerManagementRow> = {
+    key: "name",
+    label: "ライバー名",
+    accessor: (r) => r.name,
+    searchable: true,
+    render: (r) => (
+      // アーカイブ済みでも過去のライブは見られる。詳細への導線は必ず残す。
+      <Link href={`/streamers/${r.tiktokAccountId}`} className="ranking-name-cell">
+        <Avatar name={r.name} src={avatarUrl(r.avatarPath)} size={30} />
+        {r.name}
+      </Link>
+    ),
+  };
+
+  const activeColumns: Column<StreamerManagementRow>[] = [
     {
-      key: "archived",
+      key: "state",
       label: "状態",
-      accessor: (r) => (r.archived ? "アーカイブ済み" : "有効"),
+      accessor: stateOf,
       filterable: true,
-      width: "120px",
+      width: "100px",
       // "監視中" (the reference mock's label) would imply an active
       // watch.py connection this DB-only management view has no way to
-      // know about -- 有効/アーカイブ済み is what's actually true here.
-      render: (r) => <StatusBadge label={r.archived ? "アーカイブ済み" : "有効"} tone={r.archived ? "muted" : "success"} />,
-    },
-    {
-      key: "name",
-      label: "ライバー名",
-      accessor: (r) => r.name,
-      searchable: true,
+      // know about -- 有効/無効 is what's actually true here.
       render: (r) => (
-        <Link href={`/streamers/${r.tiktokAccountId}`} className="ranking-name-cell">
-          <Avatar name={r.name} src={avatarUrl(r.avatarPath)} size={30} />
-          {r.name}
-        </Link>
+        <StatusBadge label={stateOf(r)} tone={r.enabled ? "success" : "warning"} />
       ),
     },
+    nameColumn,
     { key: "tiktokAccountId", label: "TikTokアカウントID", accessor: (r) => r.tiktokAccountId, searchable: true },
     { key: "sessionCount", label: "配信数", accessor: (r) => r.sessionCount, align: "right", width: "90px" },
     {
@@ -101,11 +108,71 @@ export function StreamerManagement({ initialRows }: { initialRows: StreamerManag
       key: "actions",
       label: "操作",
       accessor: () => null,
-      width: "110px",
+      width: "190px",
       render: (r) => (
-        <button type="button" onClick={() => toggleArchived(r)} disabled={busyId === r.id}>
-          {busyId === r.id ? "処理中..." : r.archived ? "復元" : "アーカイブ"}
+        <span className="streamer-actions">
+          <button type="button" onClick={() => patch(r, { enabled: !r.enabled })}
+                  disabled={busyId === r.id}>
+            {busyId === r.id ? "処理中..." : r.enabled ? "無効にする" : "有効にする"}
+          </button>
+          <button type="button" onClick={() => patch(r, { archived: true })}
+                  disabled={busyId === r.id}>
+            アーカイブ
+          </button>
+        </span>
+      ),
+    },
+  ];
+
+  // アーカイブタブは一覧性だけあればよい。通常タブと同じ情報量は要らないが、
+  // **有効/無効に戻す導線は必ず残す**(誤操作の復旧、再契約)。
+  const archivedColumns: Column<StreamerManagementRow>[] = [
+    nameColumn,
+    { key: "tiktokAccountId", label: "TikTokアカウントID", accessor: (r) => r.tiktokAccountId, searchable: true },
+    { key: "sessionCount", label: "配信数", accessor: (r) => r.sessionCount, align: "right", width: "90px" },
+    {
+      key: "archivedAt",
+      label: "アーカイブ日時",
+      accessor: (r) => r.archivedAt,
+      render: (r) => formatJst(r.archivedAt),
+      width: "170px",
+    },
+    {
+      key: "actions",
+      label: "操作",
+      accessor: () => null,
+      width: "120px",
+      render: (r) => (
+        <button type="button" onClick={() => patch(r, { archived: false })}
+                disabled={busyId === r.id}>
+          {busyId === r.id ? "処理中..." : "元に戻す"}
         </button>
+      ),
+    },
+  ];
+
+  const active = rows.filter((r) => !r.archived);
+  const archived = rows.filter((r) => r.archived);
+
+  const tabs: TabDef[] = [
+    {
+      key: "active",
+      label: `通常（${active.length}人）`,
+      accent: "cyan",
+      content: (
+        <DataTable rows={active} columns={activeColumns}
+                   defaultSort={{ key: "name", dir: "asc" }}
+                   emptyMessage="登録されたライバーがいません。" />
+      ),
+    },
+    {
+      key: "archived",
+      label: `アーカイブ（${archived.length}人）`,
+      accent: "purple",
+      content: (
+        <DataTable rows={archived} columns={archivedColumns}
+                   defaultSort={{ key: "archivedAt", dir: "desc" }}
+                   emptyMessage="アーカイブ済みのライバーはいません。" />
       ),
     },
   ];
@@ -135,7 +202,7 @@ export function StreamerManagement({ initialRows }: { initialRows: StreamerManag
       </form>
 
       <h2>登録ライバー一覧</h2>
-      <DataTable rows={rows} columns={columns} defaultSort={{ key: "name", dir: "asc" }} emptyMessage="登録されたライバーがいません。" />
+      <Tabs tabs={tabs} />
     </div>
   );
 }

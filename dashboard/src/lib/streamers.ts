@@ -6,6 +6,9 @@ export type StreamerManagementRow = {
   tiktokAccountId: string;
   archived: boolean;
   archivedAt: string | null;
+  /** 一時的に巡回・録画の対象から外しているか。**archived とは別の軸**で、
+      archived=true のときは意味を持たない(アーカイブが優先)。 */
+  enabled: boolean;
   createdAt: string;
   sessionCount: number;
   lastSessionAt: string | null;
@@ -25,15 +28,21 @@ export function listStreamersForManagement(): StreamerManagementRow[] {
         s.tiktok_account_id as tiktokAccountId,
         s.archived as archived,
         s.archived_at as archivedAt,
+        s.enabled as enabled,
         s.created_at as createdAt,
         s.avatar_path as avatarPath,
         (SELECT COUNT(*) FROM live_sessions WHERE streamer_id = s.id) as sessionCount,
         (SELECT MAX(started_at) FROM live_sessions WHERE streamer_id = s.id) as lastSessionAt
       FROM streamers s
-      ORDER BY s.archived ASC, s.name ASC`
+      ORDER BY s.archived ASC, s.enabled DESC, s.name ASC`
     )
-    .all() as (Omit<StreamerManagementRow, "archived"> & { archived: number })[];
-  return rows.map((r) => ({ ...r, archived: Boolean(r.archived) }));
+    .all() as (Omit<StreamerManagementRow, "archived" | "enabled"> &
+      { archived: number; enabled: number })[];
+  return rows.map((r) => ({
+    ...r,
+    archived: Boolean(r.archived),
+    enabled: Boolean(r.enabled),
+  }));
 }
 
 export class StreamerManagementError extends Error {}
@@ -66,6 +75,18 @@ export function addStreamer(tiktokAccountId: string, name: string): { id: number
 // live_sessions/live_events row referencing this streamer stays intact and
 // reachable by direct link. archived=false clears archived_at too, mirroring
 // tiktok_monitor/db.py's unarchive_streamer.
+/**
+ * 一時的に巡回・録画の対象から外す/戻す。通常の一覧には表示され続ける。
+ *
+ * **アーカイブとは別の軸。** アーカイブは退所済みで専用タブへ分離するもの、
+ * 無効は「今は録らないが在籍している」状態。過去データはどちらも保持する。
+ */
+export function setStreamerEnabled(id: number, enabled: boolean): void {
+  const db = getWritableDb();
+  const info = db.prepare(`UPDATE streamers SET enabled = ? WHERE id = ?`).run(enabled ? 1 : 0, id);
+  if (info.changes === 0) throw new StreamerManagementError("そのライバーは見つかりません。");
+}
+
 export function setStreamerArchived(id: number, archived: boolean): void {
   const db = getWritableDb();
   db.prepare(`UPDATE streamers SET archived = ?, archived_at = ? WHERE id = ?`).run(

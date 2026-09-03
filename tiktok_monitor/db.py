@@ -17,6 +17,15 @@ CREATE TABLE IF NOT EXISTS streamers (
     created_at TEXT NOT NULL,
     archived INTEGER NOT NULL DEFAULT 0,
     archived_at TEXT,
+    -- 一時的に巡回・録画の対象から外すフラグ。**archived とは別の軸**。
+    -- 状態は3つ: 有効(archived=0, enabled=1) / 無効(archived=0, enabled=0)
+    --            アーカイブ(archived=1。enabled は意味を持たない)
+    --
+    -- archived と統合して status 1列にすることも検討したが、既存の
+    -- `archived = 0` フィルタが「通常の一覧(有効+無効)」の意味を
+    -- そのまま保てるため、こちらを採った。書き換え範囲が小さく、
+    -- 稼働中の録画プロセスに触れずに移行できる。
+    enabled INTEGER NOT NULL DEFAULT 1,
     -- Path to a locally-cached copy of the streamer's TikTok avatar image
     -- (see fetch_avatars.py) -- NULL until a fetch succeeds. Never a live
     -- CDN URL: TikTok's avatar URLs are signed and, per fetch_avatars.py's
@@ -295,6 +304,10 @@ def _migrate_add_streamer_archive_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE streamers ADD COLUMN archived INTEGER NOT NULL DEFAULT 0")
     if "archived_at" not in columns:
         conn.execute("ALTER TABLE streamers ADD COLUMN archived_at TEXT")
+    if "enabled" not in columns:
+        # 既存行はすべて有効として扱う。無効という状態はこの列を足すまで
+        # 存在しなかったので、これ以外の解釈はない。
+        conn.execute("ALTER TABLE streamers ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1")
     conn.commit()
 
 
@@ -378,8 +391,16 @@ def unarchive_streamer(conn: sqlite3.Connection, streamer_id: int) -> None:
     conn.commit()
 
 
+def set_streamer_enabled(conn: sqlite3.Connection, streamer_id: int, enabled: bool) -> None:
+    """一時的に巡回・録画の対象から外す/戻す。**アーカイブとは別の軸**で、
+    通常の一覧には表示され続ける。過去データには一切触れない。"""
+    conn.execute("UPDATE streamers SET enabled = ? WHERE id = ?", (1 if enabled else 0, streamer_id))
+    conn.commit()
+
+
 def list_streamers(conn: sqlite3.Connection, include_archived: bool = True) -> list[dict]:
-    query = "SELECT id, name, tiktok_account_id, archived, archived_at, created_at FROM streamers"
+    query = ("SELECT id, name, tiktok_account_id, archived, archived_at, created_at, enabled "
+             "FROM streamers")
     if not include_archived:
         query += " WHERE archived = 0"
     query += " ORDER BY archived ASC, name ASC"
@@ -392,6 +413,7 @@ def list_streamers(conn: sqlite3.Connection, include_archived: bool = True) -> l
             "archived": bool(r[3]),
             "archived_at": r[4],
             "created_at": r[5],
+            "enabled": bool(r[6]),
         }
         for r in rows
     ]

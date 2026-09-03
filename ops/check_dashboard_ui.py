@@ -6,6 +6,7 @@ check_dashboard_nav.py はサーバが返すHTMLしか見ないので、タブ�
 UIを触るたびに壊れ得るうえ、壊れても200が返るので気づきにくい。
 
 固定する挙動:
+  0. 通知設定のCSV往復(エクスポート/インポート)
   1. ライブ一覧の既定タブが「直近のライブ」であること
   2. ソートを切り替えると順位が表示順に追随すること
   3. 「上位ほど良い」ではない並び(昇順・名前順・日時順)では、
@@ -24,8 +25,15 @@ UIを触るたびに壊れ得るうえ、壊れても200が返るので気づき
 """
 import argparse
 import asyncio
+import base64
+import json
 import os
+import sqlite3
+import subprocess
 import sys
+import tempfile
+import urllib.error
+import urllib.request
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ENV_LOCAL = os.path.join(REPO_ROOT, "dashboard", ".env.local")
@@ -182,6 +190,190 @@ def check_decoration_present(check: Check, rows: list[dict], label: str) -> None
              f"メダル{medals} TOP{tops}")
 
 
+# --- 通知設定のCSV往復 ------------------------------------------------------
+# 通知設定は「静かに壊れる」機能で、壊れても画面はエラーを出さず、
+# 進捗通知が届かなくなって初めて気づく。CSV は特に、検証が1つ緩んだだけで
+# 「設定したつもりが反映されていない」状態になる。
+#
+# **本番の割り当てを変更しない。** 検査専用のグループを作り、その列だけを
+# 対象にした CSV で試す(CSVに列が無いグループは変更されない、という仕様
+# そのものを利用する)。グループは finally で必ず消す -- 実行後に元へ戻す
+# 方式だと、途中で落ちたときに汚れが残る。
+CHECK_GROUP_PREFIX = "__UI検査__"
+
+
+def _db_path() -> str:
+    return os.path.join(REPO_ROOT, "data", "proxy_pool_trial", "proxy5.db")
+
+
+def _assignment_count() -> int:
+    conn = sqlite3.connect(f"file:{_db_path()}?mode=ro", uri=True)
+    try:
+        return conn.execute("SELECT COUNT(*) FROM notification_group_streamers").fetchone()[0]
+    finally:
+        conn.close()
+
+
+def _assignments_excluding(group_id: int) -> set:
+    conn = sqlite3.connect(f"file:{_db_path()}?mode=ro", uri=True)
+    try:
+        return {
+            (g, s) for g, s in conn.execute(
+                "SELECT group_id, streamer_id FROM notification_group_streamers WHERE group_id != ?",
+                (group_id,),
+            )
+        }
+    finally:
+        conn.close()
+
+
+def _auth_header() -> dict:
+    creds = load_credentials()
+    if not creds:
+        return {}
+    token = base64.b64encode(f"{creds[0]}:{creds[1]}".encode()).decode()
+    return {"Authorization": f"Basic {token}"}
+
+
+def _request(base: str, path: str, method: str = "GET",
+             payload: dict | None = None) -> tuple[int, object]:
+    """APIを叩いて (HTTPコード, 本文) を返す。本文はJSONなら辞書、でなければ文字列。"""
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    headers = _auth_header()
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(base + path, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as res:
+            raw = res.read().decode("utf-8")
+            status = res.status
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8")
+        status = e.code
+    try:
+        return status, json.loads(raw)
+    except json.JSONDecodeError:
+        return status, raw
+
+
+def _post_csv(base: str, csv_text: str, apply: bool) -> tuple[int, dict]:
+    status, body = _request(base, "/api/notifications/assignments", "POST",
+                            {"csv": csv_text, "apply": apply})
+    return status, body if isinstance(body, dict) else {}
+
+
+def _create_check_group(base: str) -> int | None:
+    name = f"{CHECK_GROUP_PREFIX}{os.getpid()}"
+    status, groups = _request(base, "/api/notifications/groups", "POST",
+                              {"name": name, "roomId": "0"})
+    if status != 200 or not isinstance(groups, list):
+        return None
+    for g in groups:
+        if g.get("name") == name:
+            return g.get("id")
+    return None
+
+
+def _delete_group(base: str, group_id: int) -> None:
+    _request(base, f"/api/notifications/groups/{group_id}", "DELETE")
+
+
+async def check_csv_transfer(base: str, page, check: Check) -> None:
+    print("\n--- 0. 通知設定のCSV往復 ---")
+    group_id = _create_check_group(base)
+    if group_id is None:
+        check.ok(False, "検査用グループを作成できない")
+        return
+
+    tmpdir = tempfile.mkdtemp(prefix="ui-check-csv-")
+    try:
+        code, export_body = _request(base, "/api/notifications/assignments")
+        check.ok(code == 200 and isinstance(export_body, str), "CSVをエクスポートできる", f"HTTP {code}")
+        check.ok(export_body.startswith("\ufeff"), "BOM付き(Excelで文字化けしない)")
+
+        header = export_body.lstrip("\ufeff").splitlines()[0]
+        heading = f"[#{group_id}]"
+        check.ok(heading in header, "見出しにグループIDが入っている", header[:80])
+
+        # (1) 往復の安定性。**apply ではなく preview で確かめる。**
+        # 差分が出ないことを先に確認してから書き込む方が安全で、
+        # 万一バグがあっても本番の割り当てを壊さずに検出できる。
+        status, body = _post_csv(base, export_body, apply=False)
+        ok = status == 200 and not body.get("added") and not body.get("removed")
+        check.ok(ok, "エクスポートしたCSVをそのまま入れると差分0",
+                 f"HTTP {status} 追加{len(body.get('added', []))}/削除{len(body.get('removed', []))}")
+
+        # (2) 存在しない username は 422 で拒否し、DBを変えない
+        before = _assignment_count()
+        status, body = _post_csv(
+            base, f"username,表示名,検査 [#{group_id}]\n__no_such_user__,,1\n", apply=True)
+        check.ok(status == 422, "存在しないusernameを422で拒否", f"HTTP {status}")
+        check.ok(any("登録されていません" in e for e in body.get("errors", [])),
+                 "拒否の理由を返す", str(body.get("errors"))[:60])
+        check.ok(_assignment_count() == before, "拒否時にDBが変わっていない")
+
+        # (3) 検査用グループの列だけを持つCSVを適用し、他グループが保護されるか
+        conn = sqlite3.connect(f"file:{_db_path()}?mode=ro", uri=True)
+        target = conn.execute(
+            "SELECT tiktok_account_id FROM streamers WHERE archived = 0 ORDER BY id LIMIT 1"
+        ).fetchone()
+        conn.close()
+        others_before = _assignments_excluding(group_id)
+        scoped = f"username,表示名,検査 [#{group_id}]\n{target[0]},,1\n"
+        status, body = _post_csv(base, scoped, apply=True)
+        check.ok(status == 200 and len(body.get("added", [])) == 1,
+                 "検査用グループへの割り当てを適用できる", f"HTTP {status}")
+        check.ok(_assignments_excluding(group_id) == others_before,
+                 "CSVに列が無いグループの割り当てが保護される")
+        check.ok(any("含まれていない" in w for w in body.get("warnings", [])),
+                 "CSVに無いライバーを警告する")
+
+        # (4) 差分プレビューが件数だけでなく一覧を出すこと(画面で確認)
+        csv_path = os.path.join(tmpdir, "check.csv")
+        with open(csv_path, "w", encoding="utf-8") as f:
+            f.write("\ufeff" + f"username,表示名,検査 [#{group_id}]\n{target[0]},,0\n")
+        await page.goto(base + "/settings/notifications", wait_until="networkidle")
+        await page.set_input_files("input[type=file]", csv_path)
+        await page.wait_for_timeout(2500)
+        # **差分の領域に限って見る。** ページ全体を対象にすると、同じ名前が
+        # グループのメンバー一覧など他の場所にも出ているため、差分の一覧を
+        # 消しても検査が通ってしまう(実際に退行を注入して確認した)。
+        diff_text = await page.evaluate(
+            """() => {
+                const head = [...document.querySelectorAll('*')]
+                  .find(e => e.textContent.trim() === 'CSVで一括編集');
+                if (!head) return '';
+                const card = head.parentElement;
+                const lists = [...card.querySelectorAll('ul')];
+                return lists.map(u => u.innerText).join('\\n');
+            }"""
+        )
+        card_text = await page.evaluate(
+            """() => {
+                const head = [...document.querySelectorAll('*')]
+                  .find(e => e.textContent.trim() === 'CSVで一括編集');
+                return head ? head.parentElement.innerText : '';
+            }"""
+        )
+        check.ok("削除される" in card_text, "差分プレビューが表示される")
+        check.ok(target[0] in diff_text, "誰が対象かを差分の一覧に出す(件数だけでない)",
+                 f"@{target[0]} が一覧に含まれるか")
+        check.ok("この内容で反映する" in card_text, "確認してから反映するボタンがある")
+    finally:
+        # **必ず片付ける。** グループを消せば割り当ても CASCADE で消える。
+        _delete_group(base, group_id)
+        for name in os.listdir(tmpdir):
+            os.remove(os.path.join(tmpdir, name))
+        os.rmdir(tmpdir)
+        conn = sqlite3.connect(f"file:{_db_path()}?mode=ro", uri=True)
+        left = conn.execute(
+            "SELECT COUNT(*) FROM notification_groups WHERE name LIKE ?",
+            (CHECK_GROUP_PREFIX + "%",)).fetchone()[0]
+        conn.close()
+        check.ok(left == 0, "検査用グループを削除した", f"残り {left}件")
+        check.ok(not os.path.exists(tmpdir), "一時CSVを削除した")
+
+
 async def run(base: str) -> int:
     from playwright.async_api import async_playwright
 
@@ -194,6 +386,8 @@ async def run(base: str) -> int:
             viewport={"width": 1500, "height": 950},
         )
         page = await context.new_page()
+
+        await check_csv_transfer(base, page, check)
 
         # --- 1. ホームからの導線と既定タブ ---
         print("\n--- 1. ホーム『直近のライブ』→ ライブ一覧の既定タブ ---")

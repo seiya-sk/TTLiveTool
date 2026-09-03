@@ -77,6 +77,7 @@ def main() -> int:
         total_rows = 0
 
         worst_lock_ms = 0.0
+        batch_sizes: list = []
 
         total_batches = 0
         done_sessions = []
@@ -92,6 +93,8 @@ def main() -> int:
             if result.get("worst_lock_ms"):
                 worst_lock_ms = max(worst_lock_ms, result["worst_lock_ms"])
                 total_batches += result.get("batches", 0)
+                if result.get("batch_sizes") and not batch_sizes:
+                    batch_sizes = result["batch_sizes"]   # 最初のセッションぶんを代表として残す
             done_sessions.extend(result["session_ids"])
             skipped.extend(result["skipped"])
 
@@ -118,6 +121,7 @@ def main() -> int:
         # ここが100msを超えていたらバッチが大きすぎる。
         "worst_lock_ms": round(worst_lock_ms, 1),
         "batches": total_batches,
+        "batch_sizes": batch_sizes,
         "skipped": skipped,
     }
 

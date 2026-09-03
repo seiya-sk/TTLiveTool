@@ -341,3 +341,30 @@ def test_battle_and_treasure_box_also_fall_back(tmp_path, monkeypatch):
     assert ok is False
     entries = [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines() if l.strip()]
     assert entries[0]["event_type"] == "battle_opponent"
+
+
+def test_batch_sizes_do_not_oscillate_between_the_limits(tmp_path):
+    """適応方式が上下限を **往復** しないこと。
+
+    見るべきは行数そのものではなく、ロック保持が予算に収まっていること。
+    行数が上限(または下限)に落ち着くのは正常 -- 1行が軽ければ大きく、
+    重ければ小さくなるだけで、それが適応の目的。
+    問題なのは 25 と 1000 を交互に行き来する状態で、そのとき大きい側の
+    バッチがロックを長く持つ。
+
+    実測の推移は [50, 184, 566] のように控えめな初期値から目標へ
+    上がっていく形になる(2026-09-03)。
+    """
+    conn, sids = make_db(tmp_path / "conv.db", sessions=2, events_per_session=400,
+                         payload_bytes=23_000)
+    stats: dict = {}
+    cleanup.delete_raw_payloads_batched(conn, sids, pause_sec=0, stats=stats)
+
+    sizes = [s for s in stats["batch_sizes"] if isinstance(s, int)]
+    assert sizes, "バッチが1回も走っていない"
+    lo, hi = cleanup.DELETE_BATCH_MIN_ROWS, cleanup.DELETE_BATCH_MAX_ROWS
+    for a, b in zip(sizes, sizes[1:]):
+        assert not (a == lo and b == hi), f"下限と上限を往復している: {sizes}"
+        assert not (a == hi and b == lo), f"上限と下限を往復している: {sizes}"
+    # 適応の結果として、ロック保持が予算に収まっていることが本題
+    assert stats["worst_lock_ms"] <= 200, stats

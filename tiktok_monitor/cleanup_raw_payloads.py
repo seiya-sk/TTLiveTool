@@ -99,6 +99,9 @@ def delete_raw_payloads_batched(
     deleted = 0
     worst_ms = 0.0
     batches = 0
+    # 行数の推移。適応方式が収束しているか(上下限を振動していないか)を
+    # 後から確認するために残す。値そのものより「落ち着いたかどうか」を見る。
+    size_history: list[int] = []
     while True:
         rowids = [r[0] for r in conn.execute(select_sql, (*session_ids, rows))]
         if not rowids:
@@ -113,6 +116,7 @@ def delete_raw_payloads_batched(
         deleted += len(rowids)
         batches += 1
         worst_ms = max(worst_ms, held_ms)
+        size_history.append(len(rowids))
 
         if batch_rows is None and held_ms > 0:
             # 実測から1行あたりの所要を出し、目標時間に収まる行数へ寄せる。
@@ -126,6 +130,10 @@ def delete_raw_payloads_batched(
         stats["batches"] = batches
         stats["worst_lock_ms"] = round(worst_ms, 1)
         stats["last_batch_rows"] = rows
+        # 全部は残さない(数千バッチになりうる)。最初と最後だけあれば
+        # 「収束したか」「振動しているか」は読み取れる。
+        stats["batch_sizes"] = (size_history[:5] + ["..."] + size_history[-5:]
+                                if len(size_history) > 10 else size_history)
     return deleted
 
 

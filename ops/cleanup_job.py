@@ -75,6 +75,10 @@ def main() -> int:
         eligible = cleanup_module.find_eligible_session_ids(conn, args.retention_days)
 
         total_rows = 0
+
+        worst_lock_ms = 0.0
+
+        total_batches = 0
         done_sessions = []
         skipped = []
         for sid in eligible:
@@ -83,6 +87,11 @@ def main() -> int:
                 conn, [sid], dry_run=args.dry_run
             )
             total_rows += result["rows"]
+            # バッチのロック保持時間(実測)。100ms を超えていたらバッチが
+            # 大きすぎるサイン -- 録画側の書き込みを待たせている。
+            if result.get("worst_lock_ms"):
+                worst_lock_ms = max(worst_lock_ms, result["worst_lock_ms"])
+                total_batches += result.get("batches", 0)
             done_sessions.extend(result["session_ids"])
             skipped.extend(result["skipped"])
 
@@ -105,6 +114,10 @@ def main() -> int:
         "wal_bytes_after": after["wal_bytes"],
         "freelist_pages_after": after["freelist_pages"],
         "elapsed_sec": round(time.monotonic() - started, 3),
+        # 1バッチあたりの最大ロック保持時間。録画側を待たせた時間の上限で、
+        # ここが100msを超えていたらバッチが大きすぎる。
+        "worst_lock_ms": round(worst_lock_ms, 1),
+        "batches": total_batches,
         "skipped": skipped,
     }
 
@@ -113,12 +126,13 @@ def main() -> int:
 
     logger.info(
         "%sraw_payload cleanup: retention=%dd, %d/%d session(s) cleaned, %d row(s) deleted, "
-        "reclaimed~%s, db=%s (wal=%s), %.1fs",
+        "reclaimed~%s, db=%s (wal=%s), %.1fs, ロック最大 %.0fms/%dバッチ",
         "[dry-run] " if args.dry_run else "",
         summary["retention_days"],
         summary["sessions_cleaned"], summary["sessions_eligible"], summary["rows_deleted"],
         mb(summary["reclaimed_bytes_est"]), mb(summary["db_bytes_after"]),
         mb(summary["wal_bytes_after"]), summary["elapsed_sec"],
+        summary["worst_lock_ms"], summary["batches"],
     )
     if skipped:
         logger.warning("skipped: %s", skipped)

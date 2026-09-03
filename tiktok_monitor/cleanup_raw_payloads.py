@@ -43,25 +43,37 @@ def get_retention_days(conn: sqlite3.Connection) -> int:
         return DEFAULT_RETENTION_DAYS
 
 
-# 1トランザクションで消す行数。**ロックの保持時間を短く保つのが目的。**
-# 以前は対象セッション全部を1文で消しており、最大19,070行(約430MB)を
-# 1トランザクションで処理して書き込みロックを最長47.7秒握っていた。
-# その間、録画側の INSERT が busy_timeout(5秒)を超えて失敗し、
-# 2026-09-02 の一晩でイベント24件が失われた。
+# 1バッチのロック保持時間の目標。**行数ではなく時間で決める。**
 #
-# 1行あたり約23KBなので、500行で約11MB。実測でコミットまで1秒未満に収まる。
-DELETE_BATCH_ROWS = 500
+# 当初は「500行ずつ」という固定の行数にしていたが、本番では1バッチ574msを
+# 要した(2026-09-03 実測)。合成テストの生ペイロードが3KBだったのに対し、
+# 本番は約23KB -- 22倍重く、行数で決めた見積もりが外れた。
+# ペイロードの大きさは配信の内容で変わるので、行数を固定する限り同じ外し方を
+# 繰り返す。実測した1行あたりの所要から行数を毎回決め直す。
+#
+# 元の問題: 対象セッション全部を1文で消しており、最大19,070行(約430MB)を
+# 1トランザクションで処理して書き込みロックを最長47.7秒握っていた。その間、
+# 録画側の INSERT が busy_timeout(5秒)を超えて失敗し、一晩でイベント24件を失った。
+DELETE_BATCH_TARGET_MS = 80.0
+# 目標に届かなくても、この範囲は超えない。上限は1バッチが重くなりすぎないため、
+# 下限は極端に細切れにしてオーバーヘッドだけが増えるのを避けるため。
+DELETE_BATCH_MIN_ROWS = 25
+DELETE_BATCH_MAX_ROWS = 1000
+# 最初の1バッチは実測値が無いので控えめに始める(重いペイロードでも目標を超えにくい)。
+DELETE_BATCH_START_ROWS = 50
 # バッチ間に挟む休止。SQLite のロック取得は先着順を保証しないので、
 # 間を空けずに次のバッチへ行くと掃除側が連続で取り続けうる。
 # 録画側に確実に順番が回るようにする。
-DELETE_BATCH_PAUSE_SEC = 0.05
+DELETE_BATCH_PAUSE_SEC = 0.02
 
 
 def delete_raw_payloads_batched(
     conn: sqlite3.Connection,
     session_ids: list[int],
-    batch_rows: int = DELETE_BATCH_ROWS,
+    batch_rows: int | None = None,
     pause_sec: float = DELETE_BATCH_PAUSE_SEC,
+    target_ms: float = DELETE_BATCH_TARGET_MS,
+    stats: dict | None = None,
 ) -> int:
     """対象セッションの生ペイロードを小分けにして削除し、削除件数を返す。
 
@@ -83,17 +95,37 @@ def delete_raw_payloads_batched(
         WHERE e.live_session_id IN ({placeholders})
         LIMIT ?
     """
+    rows = batch_rows or DELETE_BATCH_START_ROWS
     deleted = 0
+    worst_ms = 0.0
+    batches = 0
     while True:
-        rowids = [r[0] for r in conn.execute(select_sql, (*session_ids, batch_rows))]
+        rowids = [r[0] for r in conn.execute(select_sql, (*session_ids, rows))]
         if not rowids:
             break
+        # ここからコミットまでが書き込みロックを持っている区間。時間を測って
+        # 次のバッチの行数を決める。
+        t0 = time.monotonic()
         marks = ",".join("?" for _ in rowids)
         conn.execute(f"DELETE FROM live_event_raw_payloads WHERE rowid IN ({marks})", rowids)
         conn.commit()
+        held_ms = (time.monotonic() - t0) * 1000
         deleted += len(rowids)
+        batches += 1
+        worst_ms = max(worst_ms, held_ms)
+
+        if batch_rows is None and held_ms > 0:
+            # 実測から1行あたりの所要を出し、目標時間に収まる行数へ寄せる。
+            per_row = held_ms / len(rowids)
+            rows = int(max(DELETE_BATCH_MIN_ROWS,
+                           min(DELETE_BATCH_MAX_ROWS, target_ms / per_row)))
         if pause_sec:
             time.sleep(pause_sec)
+
+    if stats is not None:
+        stats["batches"] = batches
+        stats["worst_lock_ms"] = round(worst_ms, 1)
+        stats["last_batch_rows"] = rows
     return deleted
 
 
@@ -136,15 +168,19 @@ def cleanup_raw_payloads(
 
     session_ids = find_eligible_session_ids(conn, retention_days)
     row_count = _raw_payload_row_count(conn, session_ids)
+    # バッチの実測値(ロック保持時間)。本番で目標に収まっているかを
+    # ログから確認できるようにするため、結果に載せて返す。
+    batch_stats: dict = {}
 
     if not dry_run and session_ids:
-        delete_raw_payloads_batched(conn, session_ids)
+        delete_raw_payloads_batched(conn, session_ids, stats=batch_stats)
 
     return {
         "retention_days": retention_days,
         "session_ids": session_ids,
         "sessions": len(session_ids),
         "rows": row_count,
+        **batch_stats,
     }
 
 
@@ -185,11 +221,13 @@ def cleanup_raw_payloads_for_session_ids(
             skipped.append({"id": sid, "reason": "not found"})
 
     row_count = _raw_payload_row_count(conn, eligible_ids)
+    batch_stats: dict = {}
 
     if not dry_run and eligible_ids:
-        delete_raw_payloads_batched(conn, eligible_ids)
+        delete_raw_payloads_batched(conn, eligible_ids, stats=batch_stats)
 
-    return {"session_ids": eligible_ids, "sessions": len(eligible_ids), "rows": row_count, "skipped": skipped}
+    return {"session_ids": eligible_ids, "sessions": len(eligible_ids), "rows": row_count,
+            "skipped": skipped, **batch_stats}
 
 
 def main() -> None:

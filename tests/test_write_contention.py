@@ -151,6 +151,44 @@ def test_batched_delete_never_holds_the_lock_long(tmp_path):
     assert worst < 1.0, f"ロックを{worst:.2f}秒占有した(バッチが効いていない)"
 
 
+def test_batch_size_adapts_to_keep_the_lock_hold_under_target(tmp_path):
+    """**行数ではなく時間で決めること。**
+
+    当初は「500行ずつ」の固定にしていたが、本番では1バッチ574msかかった
+    (2026-09-03 実測)。合成テストの生ペイロードが3KBだったのに対し本番は
+    約23KB -- 22倍重く、行数で決めた見積もりが外れた。ペイロードの大きさは
+    配信内容で変わるので、行数固定では同じ外し方を繰り返す。
+
+    ここでは本番相当の23KBで、実測のロック保持が目標に収まることを見る。
+    """
+    conn, sids = make_db(tmp_path / "adapt.db", sessions=2, events_per_session=300,
+                         payload_bytes=23_000)
+    stats: dict = {}
+    deleted = cleanup.delete_raw_payloads_batched(conn, sids, pause_sec=0, stats=stats)
+
+    assert deleted == 600
+    assert stats["worst_lock_ms"] <= 200, (
+        f"1バッチのロック保持が {stats['worst_lock_ms']}ms。"
+        f"目標 {cleanup.DELETE_BATCH_TARGET_MS}ms に寄せられていない"
+    )
+    assert stats["batches"] >= 2, "1バッチで消し切っている(分割が効いていない)"
+
+
+def test_batch_size_stays_within_bounds(tmp_path):
+    """適応させても極端な行数にしないこと。細切れはオーバーヘッドだけ増える。"""
+    conn, sids = make_db(tmp_path / "bounds.db", sessions=1, events_per_session=200,
+                         payload_bytes=200)
+    stats: dict = {}
+    cleanup.delete_raw_payloads_batched(conn, sids, pause_sec=0, stats=stats)
+    assert cleanup.DELETE_BATCH_MIN_ROWS <= stats["last_batch_rows"] <= cleanup.DELETE_BATCH_MAX_ROWS
+
+
+def test_target_is_tight_enough_to_matter():
+    """目標が緩められていないことを固定する。"""
+    assert cleanup.DELETE_BATCH_TARGET_MS <= 100
+    assert cleanup.DELETE_BATCH_START_ROWS <= 100, "初回バッチが大きいと1回目で超過する"
+
+
 def test_write_retries_then_succeeds_when_the_lock_clears(tmp_path):
     """ロックが明ければ再試行で書けること(諦めが早すぎないこと)。"""
     db_path = tmp_path / "b.db"

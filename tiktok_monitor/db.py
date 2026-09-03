@@ -391,6 +391,23 @@ def unarchive_streamer(conn: sqlite3.Connection, streamer_id: int) -> None:
     conn.commit()
 
 
+def list_monitored_usernames(conn: sqlite3.Connection) -> list[str]:
+    """巡回対象のライバー(有効かつ非アーカイブ)を返す。
+
+    録画プロセスの監視対象はここが唯一の出どころになる。UIで「無効にする」
+    を押した内容が次の巡回から効くのは、この関数を毎周読み直しているため。
+
+    名前ではなく tiktok_account_id を返す。巡回は unique_id で TikTok に
+    問い合わせるので、表示名(NULL 可・一意でない)は使えない。
+    """
+    return [
+        r[0] for r in conn.execute(
+            "SELECT tiktok_account_id FROM streamers "
+            "WHERE archived = 0 AND enabled = 1 ORDER BY tiktok_account_id"
+        )
+    ]
+
+
 def set_streamer_enabled(conn: sqlite3.Connection, streamer_id: int, enabled: bool) -> None:
     """一時的に巡回・録画の対象から外す/戻す。**アーカイブとは別の軸**で、
     通常の一覧には表示され続ける。過去データには一切触れない。"""

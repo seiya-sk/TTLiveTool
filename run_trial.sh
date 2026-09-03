@@ -21,9 +21,14 @@ unset TTS_DISABLE_SCREENSHOTS
 # <video> 待ち時間バグ(6秒固定では VPS+プロキシ経由で間に合わなかった)を
 # 直したうえで実撮影を確認済み。撮影は配信開始10分後に1枚
 # (config.py の screenshot_delay_sec)。
+# --pool-file は指定しない。監視対象は streamers テーブル
+# (archived=0 AND enabled=1)から読み、巡回1周ごとに読み直す。
+# ダッシュボードで「無効にする」を押した内容が次の巡回から効く。
+#
+# 緊急時にファイル固定へ戻すには、下に --pool-file sample/streamers_150.txt を
+# 足す(指定があればDBより優先される)。比較用にファイルは残してある。
 exec python -m tiktok_monitor.proxy_pool_trial \
   --proxies-file data/proxy_pool_trial/proxy5_ips.txt \
-  --pool-file sample/streamers_150.txt \
   --check-pace-sec 5.0 \
   --db-path data/proxy_pool_trial/proxy5.db \
   --events-path data/proxy_pool_trial/proxy5_events.jsonl \

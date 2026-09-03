@@ -128,6 +128,19 @@ MAX_STALL_RECONNECTS_PER_SESSION = 1    # 1セッションにつき1回まで
 MAX_STALL_RECONNECT_RETRIES = 2         # その1回の中でのリトライ上限
 STALL_RECONNECT_COOLDOWN_SEC = 1800.0   # 30分。連続で繋ぎ直さない
 
+# --- 監視対象の読み直し(2026-09-03)-----------------------------------------
+# 監視対象は streamers テーブル(archived=0 AND enabled=1)から読む。
+# 以前は起動時に --pool-file を1回読むだけだったので、UIで「無効にする」を
+# 押しても録画は止まらず、画面の表示と実際の動作が食い違っていた。
+#
+# 巡回1周ごとに読み直す。**読み直しに失敗しても前回の一覧で走り続ける** --
+# DBロックで監視対象が空になり全停止する事故を避けるため(2026-09-02 の一晩で
+# database is locked を24件観測しており、現実的なリスク)。
+# 0件になった場合も前回の一覧を維持して警告する。全員アーカイブのような
+# 意図的な操作もありうるが、その判断を巡回ループに持たせるより、
+# 動き続けて人が気づけるほうが安全。
+POOL_REFRESH_MIN_INTERVAL_SEC = 30.0
+
 # --- 録画枠の不足(2026-09-02)-----------------------------------------------
 # 全録画枠が埋まっている間、巡回ループは **is_live チェックすら行わずに
 # 眠っていた**。そのため「枠が足りずに録り逃した配信」が1件も記録されず、
@@ -405,6 +418,11 @@ class ProxyPoolTrial:
         self._quarantined: set[str] = set()
         # 初回接続の門番(ストールガードとは独立。上のクラスの docstring 参照)
         self._connect_gate = InitialConnectGate()
+        # 監視対象をDBから読み直すための状態。pool_loader が None なら
+        # --pool-file 由来の固定リストで、読み直しは行わない。
+        self.pool_loader = None
+        self._pool_cycle_start = 0
+        self._last_pool_refresh = 0.0
         # 枠不足で見送ったライバー -> (最後に記録した時刻, まとめた回数)
         self._shortage_last_log: dict[str, float] = {}
         self._shortage_pending: collections.Counter = collections.Counter()
@@ -466,9 +484,52 @@ class ProxyPoolTrial:
                 return slot
         return None  # every IP is currently recording
 
+    def _maybe_refresh_pool(self) -> None:
+        """巡回が1周したら監視対象を読み直す。
+
+        **失敗しても例外を投げない。** ここで落ちると巡回ループごと止まる。
+        読めなければ前回の一覧のまま走り続け、次の周でまた試す。
+        """
+        if self.pool_loader is None:
+            return
+        now = time.monotonic()
+        if now - self._last_pool_refresh < POOL_REFRESH_MIN_INTERVAL_SEC:
+            return
+        self._last_pool_refresh = now
+        try:
+            fresh = self.pool_loader()
+        except Exception as exc:
+            # DBロックなど。前回の一覧で継続する -- 監視対象が空になって
+            # 全停止するほうがはるかに悪い。
+            logger.warning("監視対象の読み直しに失敗(前回の%d人で継続): %s", len(self.pool), exc)
+            self._log("pool_refresh_failed", error=repr(exc), kept=len(self.pool))
+            return
+        if not fresh:
+            logger.warning(
+                "監視対象が0人になりました。全員アーカイブ/無効の可能性があります。"
+                "前回の%d人で継続します。", len(self.pool),
+            )
+            self._log("pool_refresh_empty", kept=len(self.pool))
+            return
+        if fresh == self.pool:
+            return
+        added = sorted(set(fresh) - set(self.pool))
+        removed = sorted(set(self.pool) - set(fresh))
+        logger.info("監視対象を更新: %d人 → %d人 (追加 %d / 除外 %d)",
+                    len(self.pool), len(fresh), len(added), len(removed))
+        self._log("pool_refreshed", before=len(self.pool), after=len(fresh),
+                  added=added[:20], removed=removed[:20])
+        self.pool = fresh
+        # 一覧が入れ替わったので、周回カーソルの位置も測り直す。
+        self._pool_cursor %= max(1, len(self.pool))
+
     def _next_candidate_username(self) -> str | None:
         """Round-robin over self.pool, skipping any username already being
         recorded by some other slot right now."""
+        # カーソルが先頭に戻った = 1周した。そこで監視対象を読み直す。
+        if self._pool_cursor <= self._pool_cycle_start:
+            self._maybe_refresh_pool()
+        self._pool_cycle_start = self._pool_cursor
         n = len(self.pool)
         if n == 0:
             return None
@@ -1076,9 +1137,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--pool-file",
-        required=True,
-        help="One TikTok unique_id per line -- the small set of known-active test streamers to check "
-        "against. Blank lines and #-comments ignored.",
+        default=None,
+        help="One TikTok unique_id per line. 指定するとDBより優先される(検証・緊急時用)。"
+        "省略すると streamers テーブルの有効なライバーを巡回1周ごとに読み直す。"
+        "Blank lines and #-comments ignored.",
     )
     parser.add_argument(
         "--check-pace-sec",
@@ -1111,15 +1173,39 @@ def main() -> None:
     if not proxy_urls:
         logger.error("no proxy URLs found in %s -- add one http://user:pass@host:port per line", args.proxies_file)
         raise SystemExit(1)
-    pool = _read_usernames_file(args.pool_file)
-    if not pool:
-        logger.error("no usernames found in %s", args.pool_file)
-        raise SystemExit(1)
+    # 監視対象の出どころ。**--pool-file の指定があればそちらを優先する** --
+    # 検証や、DBが読めないときの緊急手段として残す。指定が無ければ
+    # streamers テーブル(archived=0 AND enabled=1)を読み、巡回1周ごとに
+    # 読み直す。UIの「無効にする」が次の巡回から効くのはこの経路。
+    pool_loader = None
+    if args.pool_file:
+        pool = _read_usernames_file(args.pool_file)
+        source = f"file:{args.pool_file}"
+        if not pool:
+            logger.error("no usernames found in %s", args.pool_file)
+            raise SystemExit(1)
+    else:
+        pool_conn = db.connect(args.db_path)
+        db.init_schema(pool_conn)
+
+        def pool_loader():
+            return db.list_monitored_usernames(pool_conn)
+
+        pool = pool_loader()
+        source = "db:streamers(archived=0 AND enabled=1)"
+        if not pool:
+            logger.error(
+                "監視対象のライバーが1人もいません。ダッシュボードの"
+                "「設定 > ライバー管理」で有効なライバーを登録するか、"
+                "--pool-file を指定してください。"
+            )
+            raise SystemExit(1)
 
     logger.info(
-        "loaded %d proxy IP(s), %d test username(s), check pace=%.1fs. Ctrl+C to stop.",
+        "loaded %d proxy IP(s), %d test username(s) from %s, check pace=%.1fs. Ctrl+C to stop.",
         len(proxy_urls),
         len(pool),
+        source,
         args.check_pace_sec,
     )
     # 起動時に有効な閾値を1行で残す。定数を変えて再起動したのに反映されて
@@ -1152,6 +1238,7 @@ def main() -> None:
         pacer,
         args.events_path,
     )
+    trial.pool_loader = pool_loader
 
     try:
         asyncio.run(_run_trial(trial))

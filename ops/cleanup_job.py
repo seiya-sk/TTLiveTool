@@ -78,15 +78,20 @@ def main() -> int:
 
         worst_lock_ms = 0.0
         batch_sizes: list = []
+        carry_rows: int | None = None
 
         total_batches = 0
         done_sessions = []
         skipped = []
         for sid in eligible:
             # 1セッションずつ。ここでロック保持時間を短く保つ。
+            # 学習したバッチ行数を次のセッションへ持ち越す。持ち越さないと
+            # 毎回 START_ROWS からやり直しになり、1セッションあたり数バッチしか
+            # 無いため収束しない(2026-09-03 実測でロック最大1,755ms)。
             result = cleanup_module.cleanup_raw_payloads_for_session_ids(
-                conn, [sid], dry_run=args.dry_run
+                conn, [sid], dry_run=args.dry_run, start_rows=carry_rows
             )
+            carry_rows = result.get("last_batch_rows") or carry_rows
             total_rows += result["rows"]
             # バッチのロック保持時間(実測)。100ms を超えていたらバッチが
             # 大きすぎるサイン -- 録画側の書き込みを待たせている。

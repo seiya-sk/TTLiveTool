@@ -57,10 +57,13 @@ def get_retention_days(conn: sqlite3.Connection) -> int:
 DELETE_BATCH_TARGET_MS = 80.0
 # 目標に届かなくても、この範囲は超えない。上限は1バッチが重くなりすぎないため、
 # 下限は極端に細切れにしてオーバーヘッドだけが増えるのを避けるため。
-DELETE_BATCH_MIN_ROWS = 25
+# 下限を小さく取る。本番(DB 7.4GB・録画と並行)では1行あたり35msかかる
+# ことがあり、25行だと下限に張り付いても875msになってしまう(2026-09-03 実測)。
+DELETE_BATCH_MIN_ROWS = 5
 DELETE_BATCH_MAX_ROWS = 1000
-# 最初の1バッチは実測値が無いので控えめに始める(重いペイロードでも目標を超えにくい)。
-DELETE_BATCH_START_ROWS = 50
+# 最初の1バッチは実測値が無いので控えめに始める。ここが大きいと、重い環境で
+# 1回目だけ目標を大きく超える。
+DELETE_BATCH_START_ROWS = 10
 # バッチ間に挟む休止。SQLite のロック取得は先着順を保証しないので、
 # 間を空けずに次のバッチへ行くと掃除側が連続で取り続けうる。
 # 録画側に確実に順番が回るようにする。
@@ -74,6 +77,7 @@ def delete_raw_payloads_batched(
     pause_sec: float = DELETE_BATCH_PAUSE_SEC,
     target_ms: float = DELETE_BATCH_TARGET_MS,
     stats: dict | None = None,
+    start_rows: int | None = None,
 ) -> int:
     """対象セッションの生ペイロードを小分けにして削除し、削除件数を返す。
 
@@ -95,7 +99,11 @@ def delete_raw_payloads_batched(
         WHERE e.live_session_id IN ({placeholders})
         LIMIT ?
     """
-    rows = batch_rows or DELETE_BATCH_START_ROWS
+    # start_rows は前のセッションで学習した行数。掃除ジョブはセッションごとに
+    # この関数を呼ぶので、持ち越さないと毎回 START_ROWS からやり直しになり、
+    # 収束する前に終わる(2026-09-03 実測: 62セッションで229バッチ =
+    # 1セッションあたり3.7バッチしかなく、ロック最大が1,755msに達した)。
+    rows = batch_rows or start_rows or DELETE_BATCH_START_ROWS
     deleted = 0
     worst_ms = 0.0
     batches = 0
@@ -165,7 +173,8 @@ def _raw_payload_row_count(conn: sqlite3.Connection, session_ids: list[int]) -> 
 
 
 def cleanup_raw_payloads(
-    conn: sqlite3.Connection, retention_days: int | None = None, dry_run: bool = False
+    conn: sqlite3.Connection, retention_days: int | None = None, dry_run: bool = False,
+    start_rows: int | None = None
 ) -> dict:
     """Returns {"retention_days", "session_ids", "sessions", "rows"}.
     `rows` is always the count that were (or, in dry-run, would be)
@@ -181,7 +190,8 @@ def cleanup_raw_payloads(
     batch_stats: dict = {}
 
     if not dry_run and session_ids:
-        delete_raw_payloads_batched(conn, session_ids, stats=batch_stats)
+        delete_raw_payloads_batched(conn, session_ids, stats=batch_stats,
+                                    start_rows=start_rows)
 
     return {
         "retention_days": retention_days,
@@ -193,7 +203,8 @@ def cleanup_raw_payloads(
 
 
 def cleanup_raw_payloads_for_session_ids(
-    conn: sqlite3.Connection, session_ids: list[int], dry_run: bool = False
+    conn: sqlite3.Connection, session_ids: list[int], dry_run: bool = False,
+    start_rows: int | None = None
 ) -> dict:
     """Directly targets specific sessions by id instead of an age cutoff --
     for a one-off "purge exactly this session, nothing else" operation
@@ -232,7 +243,8 @@ def cleanup_raw_payloads_for_session_ids(
     batch_stats: dict = {}
 
     if not dry_run and eligible_ids:
-        delete_raw_payloads_batched(conn, eligible_ids, stats=batch_stats)
+        delete_raw_payloads_batched(conn, eligible_ids, stats=batch_stats,
+                                    start_rows=start_rows)
 
     return {"session_ids": eligible_ids, "sessions": len(eligible_ids), "rows": row_count,
             "skipped": skipped, **batch_stats}

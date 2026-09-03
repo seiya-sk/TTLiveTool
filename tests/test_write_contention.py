@@ -368,3 +368,38 @@ def test_batch_sizes_do_not_oscillate_between_the_limits(tmp_path):
         assert not (a == hi and b == lo), f"上限と下限を往復している: {sizes}"
     # 適応の結果として、ロック保持が予算に収まっていることが本題
     assert stats["worst_lock_ms"] <= 200, stats
+
+
+def test_batch_size_is_carried_across_sessions(tmp_path):
+    """学習したバッチ行数を次のセッションへ持ち越すこと。
+
+    掃除ジョブはセッションごとにこの関数を呼ぶ。持ち越さないと毎回
+    START_ROWS からやり直しになり、1セッションあたり数バッチしか無いため
+    収束しない。2026-09-03 の本番実測では62セッション/229バッチ
+    (1セッション3.7バッチ)で、ロック最大が1,755ms に達した。
+    """
+    conn, sids = make_db(tmp_path / "carry.db", sessions=2, events_per_session=200,
+                         payload_bytes=200)
+    first: dict = {}
+    cleanup.delete_raw_payloads_batched(conn, [sids[0]], pause_sec=0, stats=first)
+    learned = first["last_batch_rows"]
+    assert learned > cleanup.DELETE_BATCH_START_ROWS, "1セッション目で行数が伸びていない"
+
+    second: dict = {}
+    cleanup.delete_raw_payloads_batched(conn, [sids[1]], pause_sec=0, stats=second,
+                                        start_rows=learned)
+    # 要求した行数より、そのセッションに残っている行数のほうが少なければ
+    # 最初のバッチはその数で頭打ちになる。見るべきは「START_ROWS から
+    # やり直していないこと」。
+    assert second["batch_sizes"][0] > cleanup.DELETE_BATCH_START_ROWS, (
+        f"2セッション目が {second['batch_sizes'][0]}行 から始まっている"
+        f"(持ち越せていなければ {cleanup.DELETE_BATCH_START_ROWS}行)"
+    )
+
+
+def test_minimum_batch_is_small_enough_for_a_slow_environment():
+    """下限が大きいと、重い環境で下限に張り付いても目標を超える。
+    本番(DB 7.4GB・録画と並行)では1行あたり35msかかることがあり、
+    25行だと875msになっていた。"""
+    assert cleanup.DELETE_BATCH_MIN_ROWS <= 10
+    assert cleanup.DELETE_BATCH_START_ROWS <= 10

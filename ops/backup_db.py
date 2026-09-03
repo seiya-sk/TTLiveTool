@@ -20,6 +20,8 @@ DB全体 2.3GB のうち大半がこれで、しかも稼働中DBでも1日で�
 --max-total-gb を超えそうなら古い短期から先に落とす。
 """
 import argparse
+import contextlib
+import errno
 import glob
 import logging
 import os
@@ -31,6 +33,79 @@ from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger("backup_db")
 JST = timezone(timedelta(hours=9))
+
+
+# --- 二重起動の防止(2026-09-03)-------------------------------------------
+# DBが7.2GBに育ち、バックアップに12分かかるようになった。以前(74秒)なら
+# 現実的に起きなかった「タイマーの定期実行と手動実行が重なる」が起こりうる。
+#
+# 実際に発生したときの害はディスクとI/O。一時ファイルが倍(24GB)になり
+# ディスク使用率が57%まで上がり、両者がI/Oを奪い合って両方遅くなった。
+# **データ破損は起きない** -- それぞれ別ファイルに書き、稼働中DBは
+# 読み取り専用で開いているため。
+#
+# 既に実行中なら **正常終了する**(エラーにしない)。タイマーから起動された
+# 場合に失敗扱いにすると、systemd の失敗通知が鳴り続けることになる。
+# 実行中のバックアップがあるなら目的は果たされている。
+LOCK_PATH_SUFFIX = ".backup.lock"
+# 異常終了でロックが残った場合の保険。PIDの生存を先に見るので通常は使わないが、
+# PIDが再利用されている場合に備えて時間でも切る。
+LOCK_STALE_SEC = 3600
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except OSError as exc:
+        return exc.errno == errno.EPERM     # 権限が無いだけなら生きている
+    return True
+
+
+@contextlib.contextmanager
+def single_instance(lock_path: str):
+    """二重起動を弾く。取れたら True、既に走っていたら False を yield する。
+
+    古いロックの扱いは2段構え。まずPIDの生存を見て、死んでいれば奪う。
+    PIDが再利用されている可能性に備えて、時刻でも切る。
+    """
+    holder = None
+    try:
+        with open(lock_path, encoding="utf-8") as f:
+            holder = int(f.read().strip() or 0)
+    except (OSError, ValueError):
+        holder = None
+
+    if holder:
+        alive = _pid_alive(holder)
+        try:
+            age = time.time() - os.path.getmtime(lock_path)
+        except OSError:
+            age = 0.0
+        if alive and age < LOCK_STALE_SEC:
+            yield False
+            return
+        logger.warning(
+            "古いロックを無視します(pid=%s %s / %.0f分前)",
+            holder, "生存" if alive else "不在", age / 60,
+        )
+
+    try:
+        with open(lock_path, "w", encoding="utf-8") as f:
+            f.write(str(os.getpid()))
+    except OSError as exc:
+        # ロックが作れないのを理由にバックアップを止めない。二重起動の
+        # 防止は利便性のためで、バックアップそのものより優先しない。
+        logger.warning("ロックファイルを作成できませんでした(続行します): %s", exc)
+        yield True
+        return
+
+    try:
+        yield True
+    finally:
+        try:
+            os.remove(lock_path)
+        except OSError:
+            pass
 
 
 RAW_PAYLOAD_TABLE = "live_event_raw_payloads"
@@ -149,6 +224,16 @@ def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
     os.makedirs(args.dest_dir, exist_ok=True)
+
+    lock_path = os.path.join(args.dest_dir, "." + os.path.basename(args.db_path) + LOCK_PATH_SUFFIX)
+    with single_instance(lock_path) as acquired:
+        if not acquired:
+            logger.info("別のバックアップが実行中のためスキップします。")
+            return 0
+        return _run_backup(args)
+
+
+def _run_backup(args) -> int:
     db_gb = os.path.getsize(args.db_path) / 1024 ** 3
     free_gb = shutil.disk_usage(args.dest_dir).free / 1024 ** 3
 

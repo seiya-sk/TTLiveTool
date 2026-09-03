@@ -41,6 +41,17 @@ from tiktok_monitor import cleanup_raw_payloads as cleanup_module
 
 logger = logging.getLogger("cleanup_job")
 
+# ロック保持時間の警告閾値。
+#
+# **主指標は「database is locked が0件であること」**で、この時間はその副指標。
+# 当初は100msを基準にしていたが、これは「busy_timeout 30秒に対して十分小さい」
+# という程度の目安で、根拠が薄かった。実際には録画との競合が確率的に起きる
+# ため、どんな制御でも稀に外れる。100msを厳密に守ろうとすると調整が終わらない。
+#
+# 1000ms は busy_timeout(30秒)の30分の1。ここを超えたら制御が壊れている
+# サインとして警告するが、超えていてもロックエラーが0件なら目的は達成できている。
+LOCK_WARN_MS = 1000.0
+
 BUSY_TIMEOUT_MS = 30_000
 
 
@@ -93,8 +104,7 @@ def main() -> int:
             )
             carry_rows = result.get("last_batch_rows") or carry_rows
             total_rows += result["rows"]
-            # バッチのロック保持時間(実測)。100ms を超えていたらバッチが
-            # 大きすぎるサイン -- 録画側の書き込みを待たせている。
+            # バッチのロック保持時間(実測)。閾値は LOCK_WARN_MS を参照。
             if result.get("worst_lock_ms"):
                 worst_lock_ms = max(worst_lock_ms, result["worst_lock_ms"])
                 total_batches += result.get("batches", 0)
@@ -122,8 +132,7 @@ def main() -> int:
         "wal_bytes_after": after["wal_bytes"],
         "freelist_pages_after": after["freelist_pages"],
         "elapsed_sec": round(time.monotonic() - started, 3),
-        # 1バッチあたりの最大ロック保持時間。録画側を待たせた時間の上限で、
-        # ここが100msを超えていたらバッチが大きすぎる。
+        # 1バッチあたりの最大ロック保持時間。録画側を待たせた時間の上限。
         "worst_lock_ms": round(worst_lock_ms, 1),
         "batches": total_batches,
         "batch_sizes": batch_sizes,
@@ -143,6 +152,13 @@ def main() -> int:
         mb(summary["wal_bytes_after"]), summary["elapsed_sec"],
         summary["worst_lock_ms"], summary["batches"],
     )
+    if summary["worst_lock_ms"] > LOCK_WARN_MS:
+        logger.warning(
+            "バッチのロック保持が %.0fms に達しました(警告閾値 %.0fms)。"
+            "録画側の書き込みが待たされている可能性があります。"
+            "database is locked が出ていないかを確認してください。",
+            summary["worst_lock_ms"], LOCK_WARN_MS,
+        )
     if skipped:
         logger.warning("skipped: %s", skipped)
 
